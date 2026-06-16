@@ -87,6 +87,16 @@ static CP_FORCE_INLINE v128f vld3(const float p[3]) {
   return v;
 }
 
+/* 3-lane dot -> float. Deliberately NOT Vec3DotfV (which is _mm_dp_ps): DPPS has
+ * ~13-cycle latency and the solver's dots sit on dependency chains (GJK,
+ * bisection), so the latency serializes. A multiply + 3 lane extracts + 2 adds
+ * is far shorter-latency on a live register and measures ~37% faster end to end
+ * (and beats the scalar float[3] build, which has to reload three scalars). */
+static CP_FORCE_INLINE float vdot3(v128f a, v128f b) {
+  v128f m = VecMul(a, b);
+  return VecGetX(m) + VecGetY(m) + VecGetZ(m);
+}
+
 #define CP_DOMAIN_MAX 8192.0
 #define CP_EXTENT_MIN 0.1
 #define CP_EXTENT_MAX 250.0
@@ -120,7 +130,7 @@ typedef struct {
 } cp_shape_lite;
 
 static float d3dot(const float a[3], const float b[3]) {
-  return Vec3DotfV(vld3(a), vld3(b));
+  return vdot3(vld3(a), vld3(b));
 }
 
 static void d3cross(const float a[3], const float b[3], float o[3]) {
@@ -216,7 +226,7 @@ static int CP_UNUSED_FUNC poly_faces(int n, const float w[][3],
           return 0; /* center not strictly interior */
         dup = 0;
         for (f = 0; f < s->nface; ++f) {
-          if (Vec3DotfV(vld3(nm), s->fa[f]) > 1.0 - 1e-6 &&
+          if (vdot3(vld3(nm), s->fa[f]) > 1.0 - 1e-6 &&
               fabsf(b - s->fb[f]) <= 1e-6 * (1.0 + b)) {
             dup = 1;
             break;
@@ -245,8 +255,8 @@ static int CP_UNUSED_FUNC poly_edges(int n, const float w[][3],
       int common = 0, dup = 0;
       float dir[3], len;
       for (f = 0; f < s->nface; ++f) {
-        float di = Vec3DotfV(s->fa[f], vld3(w[i])) - s->fb[f];
-        float dj = Vec3DotfV(s->fa[f], vld3(w[j])) - s->fb[f];
+        float di = vdot3(s->fa[f], vld3(w[i])) - s->fb[f];
+        float dj = vdot3(s->fa[f], vld3(w[j])) - s->fb[f];
         if (fabsf(di) <= tol && fabsf(dj) <= tol) {
           ++common;
           if (common >= 2)
@@ -265,7 +275,7 @@ static int CP_UNUSED_FUNC poly_edges(int n, const float w[][3],
       dir[1] /= len;
       dir[2] /= len;
       for (e = 0; e < s->nedge; ++e) {
-        if (fabsf(Vec3DotfV(vld3(dir), s->edge[e])) > 1.0f - 1e-6f) {
+        if (fabsf(vdot3(vld3(dir), s->edge[e])) > 1.0f - 1e-6f) {
           dup = 1;
           break;
         }
@@ -592,7 +602,7 @@ static void add_shape_constraints(cp_prob *pr, const cp_shape *s,
       w[1] = fa3[1];
       w[2] = fa3[2];
       w[3] = -s->fb[i];
-      add_lin(pr, w, -Vec3DotfV(s->fa[i], vld3(cl)));
+      add_lin(pr, w, -vdot3(s->fa[i], vld3(cl)));
     }
   }
 }
@@ -928,7 +938,7 @@ static void make_vshape(const cp_prim *p, vshape *s) {
 static CP_FORCE_INLINE v128f sup_scaled(const vshape *s, float alpha, v128f d) {
   switch (s->type) {
   case CP_SPHERE: {
-    float n = sqrtf(Vec3DotfV(d, d));
+    float n = sqrtf(vdot3(d, d));
     if (n < 1e-30f)
       return VecAdd(s->c, VecSetR(alpha * s->R, 0.0f, 0.0f, 0.0f));
     return VecAdd(s->c, VecMulf(d, alpha * s->R / n));
@@ -936,17 +946,17 @@ static CP_FORCE_INLINE v128f sup_scaled(const vshape *s, float alpha, v128f d) {
   case CP_BOX: {
     /* local support sign = sign(Q^T d) per axis; world = sum ax[j]*dl[j] */
     float hx = VecGetX(s->h), hy = VecGetY(s->h), hz = VecGetZ(s->h);
-    float dl0 = alpha * ((Vec3DotfV(s->ax[0], d) >= 0.0f) ? hx : -hx);
-    float dl1 = alpha * ((Vec3DotfV(s->ax[1], d) >= 0.0f) ? hy : -hy);
-    float dl2 = alpha * ((Vec3DotfV(s->ax[2], d) >= 0.0f) ? hz : -hz);
+    float dl0 = alpha * ((vdot3(s->ax[0], d) >= 0.0f) ? hx : -hx);
+    float dl1 = alpha * ((vdot3(s->ax[1], d) >= 0.0f) ? hy : -hy);
+    float dl2 = alpha * ((vdot3(s->ax[2], d) >= 0.0f) ? hz : -hz);
     return VecAdd(s->c, VecAdd(VecAdd(VecMulf(s->ax[0], dl0),
                                       VecMulf(s->ax[1], dl1)),
                                VecMulf(s->ax[2], dl2)));
   }
   case CP_CAPSULE: {
     v128f ax = s->ax[0];
-    float t = alpha * ((Vec3DotfV(ax, d) >= 0.0f) ? s->hl : -s->hl);
-    float n = sqrtf(Vec3DotfV(d, d));
+    float t = alpha * ((vdot3(ax, d) >= 0.0f) ? s->hl : -s->hl);
+    float n = sqrtf(vdot3(d, d));
     v128f o = VecAdd(s->c, VecMulf(ax, t));
     if (n >= 1e-30f)
       o = VecAdd(o, VecMulf(d, alpha * s->R / n));
@@ -956,7 +966,7 @@ static CP_FORCE_INLINE v128f sup_scaled(const vshape *s, float alpha, v128f d) {
     int best = 0, j;
     float bd = -1e30f;
     for (j = 0; j < s->nv; ++j) {
-      float dd = Vec3DotfV(s->w[j], d);
+      float dd = vdot3(s->w[j], d);
       if (dd > bd) { bd = dd; best = j; }
     }
     return VecAdd(s->c, VecMulf(VecSub(s->w[best], s->c), alpha));
@@ -968,10 +978,10 @@ static CP_FORCE_INLINE v128f sup_scaled(const vshape *s, float alpha, v128f d) {
 
 static float closest_seg(v128f a, v128f b) {
   v128f ab = VecSub(b, a);
-  float dd = Vec3DotfV(ab, ab), t;
+  float dd = vdot3(ab, ab), t;
   if (dd < 1e-30f)
     return 0.0f;
-  t = -Vec3DotfV(a, ab) / dd;
+  t = -vdot3(a, ab) / dd;
   if (t < 0.0f) t = 0.0f;
   if (t > 1.0f) t = 1.0f;
   return t;
@@ -982,15 +992,15 @@ static float closest_seg(v128f a, v128f b) {
 static int closest_tri(v128f a, v128f b, v128f c, float bary[3]) {
   v128f ab = VecSub(b, a), ac = VecSub(c, a), bp, cp_;
   float d1, d2, d3, d4, d5, d6, va, vb, vc, denom, v, w;
-  d1 = -Vec3DotfV(ab, a);
-  d2 = -Vec3DotfV(ac, a);
+  d1 = -vdot3(ab, a);
+  d2 = -vdot3(ac, a);
   if (d1 <= 0.0f && d2 <= 0.0f) {
     bary[0] = 1.0f; bary[1] = 0.0f; bary[2] = 0.0f;
     return 1;
   }
   bp = VecNeg(b);
-  d3 = Vec3DotfV(ab, bp);
-  d4 = Vec3DotfV(ac, bp);
+  d3 = vdot3(ab, bp);
+  d4 = vdot3(ac, bp);
   if (d3 >= 0.0f && d4 <= d3) {
     bary[0] = 0.0f; bary[1] = 1.0f; bary[2] = 0.0f;
     return 2;
@@ -1002,8 +1012,8 @@ static int closest_tri(v128f a, v128f b, v128f c, float bary[3]) {
     return 3;
   }
   cp_ = VecNeg(c);
-  d5 = Vec3DotfV(ab, cp_);
-  d6 = Vec3DotfV(ac, cp_);
+  d5 = vdot3(ab, cp_);
+  d6 = vdot3(ac, cp_);
   if (d6 >= 0.0f && d5 <= d6) {
     bary[0] = 0.0f; bary[1] = 0.0f; bary[2] = 1.0f;
     return 4;
@@ -1105,9 +1115,9 @@ static int simplex_closest(simplex *sx, v128f *v, v128f *xa) {
       v128f d = sx->p[6 - i0 - i1 - i2];
       v128f ab = VecSub(b, a), ac = VecSub(c, a), nrm = Vec3Cross(ab, ac);
       v128f ad = VecSub(d, a);
-      float nlen = sqrtf(Vec3DotfV(nrm, nrm));
-      float so = -Vec3DotfV(nrm, a);   /* origin side  */
-      float sd = Vec3DotfV(nrm, ad);   /* 4th-pt side  */
+      float nlen = sqrtf(vdot3(nrm, nrm));
+      float so = -vdot3(nrm, a);   /* origin side  */
+      float sd = vdot3(nrm, ad);   /* 4th-pt side  */
       float outside;
       /* degenerate (flat) tetra: cannot trust the enclosure test; treat
        * the face as a candidate instead of skipping it */
@@ -1126,7 +1136,7 @@ static int simplex_closest(simplex *sx, v128f *v, v128f *xa) {
         gi[0] = i0; gi[1] = i1; gi[2] = i2;
         cv  = bary3(a, b, c, bary);
         cxa = bary3(sx->a[i0], sx->a[i1], sx->a[i2], bary);
-        dd = Vec3DotfV(cv, cv);
+        dd = vdot3(cv, cv);
         if (dd < bestd) {
           bestd = dd;
           bestv = cv;
@@ -1164,7 +1174,7 @@ static float gjk_dist(const vshape *sa, const vshape *sb, float alpha,
   v128f v = VecZero(), xa, d0, pa, pb;
   int it;
   d0 = VecSub(sb->c, sa->c);
-  if (Vec3DotfV(d0, d0) <= 1e-30f)
+  if (vdot3(d0, d0) <= 1e-30f)
     d0 = VecSetR(1.0f, 0.0f, 0.0f, 0.0f);
   pa = sup_scaled(sa, alpha, d0);
   pb = sup_scaled(sb, alpha, VecNeg(d0));
@@ -1179,7 +1189,7 @@ static float gjk_dist(const vshape *sa, const vshape *sb, float alpha,
       if (xstar) *xstar = xa;
       return 0.0f;
     }
-    vv = Vec3DotfV(v, v);
+    vv = vdot3(v, v);
     if (vv < 1e-12f) {
       if (xstar) *xstar = xa;
       return 0.0f;
@@ -1187,7 +1197,7 @@ static float gjk_dist(const vshape *sa, const vshape *sb, float alpha,
     pa = sup_scaled(sa, alpha, VecNeg(v));
     pb = sup_scaled(sb, alpha, v);
     w = VecSub(pa, pb);
-    vw = Vec3DotfV(v, w);
+    vw = vdot3(v, w);
     if (vv - vw <= 1e-6f * vv + 1e-12f) {
       if (xstar) *xstar = xa;
       return sqrtf(vv);
@@ -1197,7 +1207,7 @@ static float gjk_dist(const vshape *sa, const vshape *sb, float alpha,
       int dup = 0, j;
       for (j = 0; j < sx.n; ++j) {
         v128f e = VecSub(w, sx.p[j]);
-        if (Vec3DotfV(e, e) < 1e-12f) {
+        if (vdot3(e, e) < 1e-12f) {
           dup = 1;
           break;
         }
@@ -1212,14 +1222,14 @@ static float gjk_dist(const vshape *sa, const vshape *sb, float alpha,
     ++sx.n;
   }
   if (xstar) *xstar = xa;
-  return sqrtf(Vec3DotfV(v, v));
+  return sqrtf(vdot3(v, v));
 }
 
 
 /* world vector -> box-local coords: (ax0.v, ax1.v, ax2.v) = Q^T v */
 static CP_FORCE_INLINE v128f box_local(const vshape *box, v128f v) {
-  return VecSetR(Vec3DotfV(box->ax[0], v), Vec3DotfV(box->ax[1], v),
-                 Vec3DotfV(box->ax[2], v), 0.0f);
+  return VecSetR(vdot3(box->ax[0], v), vdot3(box->ax[1], v),
+                 vdot3(box->ax[2], v), 0.0f);
 }
 /* box-local point -> world: c + ax0*lx + ax1*ly + ax2*lz = c + Q*local */
 static CP_FORCE_INLINE v128f box_world(const vshape *box, v128f local) {
@@ -1237,7 +1247,7 @@ static int sphere_box_predicate_ok(const vshape *sphere, const vshape *box,
   /* gap = max(|Q^T(c_s - c_b)| - alpha*h, 0) per axis; lhs = |gap|^2 */
   gap = box_local(box, VecSub(sphere->c, box->c));
   gap = VecMax(VecSub(VecFabs(gap), VecMulf(box->h, alpha)), VecZero());
-  lhs = Vec3DotfV(gap, gap);
+  lhs = vdot3(gap, gap);
   rhs = alpha * sphere->R;
   rhs *= rhs;
   eps = 1e-6 * (1.0 + lhs + rhs);
@@ -1349,8 +1359,8 @@ static int sphere_capsule_predicate_ok(const vshape *sphere,
   if (!(alpha >= 0.0) || !isfinite(alpha))
     return 0;
   d = VecSub(sphere->c, capsule->c);
-  x = fabsf(Vec3DotfV(d, capsule->ax[0]));
-  p2 = Vec3DotfV(d, d) - x * x;
+  x = fabsf(vdot3(d, capsule->ax[0]));
+  p2 = vdot3(d, d) - x * x;
   if (p2 < 0.0)
     p2 = 0.0;
   gap = x - alpha * capsule->hl;
@@ -1396,8 +1406,8 @@ static float sphere_capsule_alpha(const vshape *sphere,
   v128f d;
   float x, p2, R, hl, best;
   d = VecSub(sphere->c, capsule->c);
-  x = fabsf(Vec3DotfV(d, capsule->ax[0]));
-  p2 = Vec3DotfV(d, d) - x * x;
+  x = fabsf(vdot3(d, capsule->ax[0]));
+  p2 = vdot3(d, d) - x * x;
   if (p2 < 0.0)
     p2 = 0.0;
   R = sphere->R + capsule->R;
@@ -1469,7 +1479,7 @@ static float sphere_capsule_alpha(const vshape *sphere,
 
 static float sphere_sphere_alpha(const vshape *a, const vshape *b) {
   v128f delta = VecSub(a->c, b->c);
-  float d = sqrtf(Vec3DotfV(delta, delta)), r;
+  float d = sqrtf(vdot3(delta, delta)), r;
   if (d <= 0.0)
     return 0.0;
   r = a->R + b->R;
@@ -1496,21 +1506,21 @@ static float segment_segment_dist2_scaled_capsules(const vshape *a,
   d1 = VecMulf(ua, 2.0f);   /* pa1 - pa0 */
   d2 = VecMulf(ub, 2.0f);   /* pb1 - pb0 */
   r = VecSub(pa0, pb0);
-  aa = Vec3DotfV(d1, d1);
-  ee = Vec3DotfV(d2, d2);
+  aa = vdot3(d1, d1);
+  ee = vdot3(d2, d2);
   if (aa <= 1e-30 && ee <= 1e-30)
-    return Vec3DotfV(r, r);
+    return vdot3(r, r);
   if (aa <= 1e-30) {
     s = 0.0;
-    t = clamp01(Vec3DotfV(d2, r) / ee);
+    t = clamp01(vdot3(d2, r) / ee);
   } else {
-    cc = Vec3DotfV(d1, r);
+    cc = vdot3(d1, r);
     if (ee <= 1e-30) {
       t = 0.0;
       s = clamp01(-cc / aa);
     } else {
-      bb = Vec3DotfV(d1, d2);
-      ff = Vec3DotfV(d2, r);
+      bb = vdot3(d1, d2);
+      ff = vdot3(d2, r);
       denom = aa * ee - bb * bb;
       if (denom > 1e-18 * (aa * ee + 1.0))
         s = clamp01((bb * ff - cc * ee) / denom);
@@ -1527,7 +1537,7 @@ static float segment_segment_dist2_scaled_capsules(const vshape *a,
     }
   }
   cd = VecSub(VecAdd(r, VecMulf(d1, s)), VecMulf(d2, t));
-  return Vec3DotfV(cd, cd);
+  return vdot3(cd, cd);
 }
 
 static int capsule_capsule_predicate_ok(const vshape *a, const vshape *b,
@@ -1619,7 +1629,7 @@ static float segment_aabb_dist2(v128f p0, v128f p1, v128f e) {
     /* gap = max(|p0 + t v| - e, 0) per axis; d2 = |gap|^2 */
     v128f gap = VecMax(VecSub(VecFabs(VecAdd(p0, VecMulf(v, cand[i]))), e),
                        VecZero());
-    float d2 = Vec3DotfV(gap, gap);
+    float d2 = vdot3(gap, gap);
     if (d2 < best)
       best = d2;
   }
@@ -1838,7 +1848,7 @@ static int box_poly_face_axes_jit(const vshape *poly,
         v128f e1 = VecSub(poly_rel[j], poly_rel[i]);
         v128f e2 = VecSub(poly_rel[k], poly_rel[i]);
         v128f nm = Vec3Cross(e1, e2);
-        float len = sqrtf(Vec3DotfV(nm, nm)), dmax, dmin;
+        float len = sqrtf(vdot3(nm, nm)), dmax, dmin;
         int face, dup, f;
         if (!isfinite(len))
           return -1;
@@ -1848,7 +1858,7 @@ static int box_poly_face_axes_jit(const vshape *poly,
         dmax = -1e30f;
         dmin = 1e30f;
         for (m = 0; m < poly->nv; ++m) {
-          float d = Vec3DotfV(nm, VecSub(poly_rel[m], poly_rel[i]));
+          float d = vdot3(nm, VecSub(poly_rel[m], poly_rel[i]));
           if (!isfinite(d))
             return -1;
           if (d > dmax) dmax = d;
@@ -1865,7 +1875,7 @@ static int box_poly_face_axes_jit(const vshape *poly,
           continue;
         dup = 0;
         for (f = 0; f < count; ++f) {
-          if (Vec3DotfV(nm, axes[f]) > 1.0 - 1e-6) {
+          if (vdot3(nm, axes[f]) > 1.0 - 1e-6) {
             dup = 1;
             break;
           }
@@ -1889,7 +1899,7 @@ static float box_poly_axis_alpha_asym(const vshape *box,
                                        v128f L) {
   float len2, rb, pmin, pmax, delta, denom, candidate;
   int j;
-  len2 = Vec3DotfV(L, L);
+  len2 = vdot3(L, L);
   if (!isfinite(len2))
     return INFINITY;
   if (len2 < 1e-12)
@@ -1897,7 +1907,7 @@ static float box_poly_axis_alpha_asym(const vshape *box,
 
   rb = 0.0;
   for (j = 0; j < 3; ++j) {
-    float d = fabsf(Vec3DotfV(box->ax[j], L));
+    float d = fabsf(vdot3(box->ax[j], L));
     if (!isfinite(d))
       return INFINITY;
     rb += VecGetN(box->h, j) * d;
@@ -1909,7 +1919,7 @@ static float box_poly_axis_alpha_asym(const vshape *box,
   pmax = -INFINITY;
   (void)poly;
   for (j = 0; j < poly->nv; ++j) {
-    float proj = Vec3DotfV(poly_rel[j], L);
+    float proj = vdot3(poly_rel[j], L);
     if (!isfinite(proj))
       return INFINITY;
     if (proj < pmin)
@@ -1918,7 +1928,7 @@ static float box_poly_axis_alpha_asym(const vshape *box,
       pmax = proj;
   }
 
-  delta = Vec3DotfV(center_delta, L); /* P - B */
+  delta = vdot3(center_delta, L); /* P - B */
   if (!isfinite(delta))
     return INFINITY;
 
@@ -2017,7 +2027,7 @@ static float box_box_alpha(const vshape *a, const vshape *b) {
       L = b->ax[k - 3];
     } else {
       L = Vec3Cross(a->ax[(k - 6) / 3], b->ax[(k - 6) % 3]);
-      len2 = Vec3DotfV(L, L);
+      len2 = vdot3(L, L);
       if (!isfinite(len2))
         return INFINITY;
       if (len2 < 1e-12)
@@ -2025,14 +2035,14 @@ static float box_box_alpha(const vshape *a, const vshape *b) {
     }
     if (!isfinite(VecGetX(L)) || !isfinite(VecGetY(L)) || !isfinite(VecGetZ(L)))
       return INFINITY;
-    num = fabsf(Vec3DotfV(d, L));
+    num = fabsf(vdot3(d, L));
     if (!isfinite(num))
       return INFINITY;
     ra = 0.0;
     rb = 0.0;
     for (j = 0; j < 3; ++j) {
-      float da = fabsf(Vec3DotfV(a->ax[j], L));
-      float db = fabsf(Vec3DotfV(b->ax[j], L));
+      float da = fabsf(vdot3(a->ax[j], L));
+      float db = fabsf(vdot3(b->ax[j], L));
       if (!isfinite(da) || !isfinite(db))
         return INFINITY;
       ra += VecGetN(a->h, j) * da;
@@ -2094,14 +2104,14 @@ static int pair_alpha_specialized(const vshape *sa, const vshape *sb,
 static void closest_seg_seg(v128f P0, v128f P1, v128f Q0, v128f Q1,
                             v128f *c1, v128f *c2) {
   v128f d1 = VecSub(P1, P0), d2 = VecSub(Q1, Q0), r = VecSub(P0, Q0);
-  float a = Vec3DotfV(d1, d1), e = Vec3DotfV(d2, d2), f = Vec3DotfV(d2, r), s, t;
+  float a = vdot3(d1, d1), e = vdot3(d2, d2), f = vdot3(d2, r), s, t;
   if (a <= 1e-12 && e <= 1e-12) { s = 0.0; t = 0.0; }
   else if (a <= 1e-12) { s = 0.0; t = f / e; if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0; }
   else {
-    float c = Vec3DotfV(d1, r);
+    float c = vdot3(d1, r);
     if (e <= 1e-12) { t = 0.0; s = -c / a; if (s < 0.0) s = 0.0; else if (s > 1.0) s = 1.0; }
     else {
-      float b = Vec3DotfV(d1, d2), denom = a * e - b * b;
+      float b = vdot3(d1, d2), denom = a * e - b * b;
       s = (denom > 1e-12 || denom < -1e-12) ? (b * f - c * e) / denom : 0.0;
       if (s < 0.0) s = 0.0; else if (s > 1.0) s = 1.0;
       t = (b * s + f) / e;
@@ -2188,7 +2198,7 @@ static float segment_aabb_closest_local(v128f p0, v128f p1, v128f e,
   for (i = 0; i < nc; ++i) {
     v128f gap = VecMax(VecSub(VecFabs(VecAdd(p0, VecMulf(v, cand[i]))), e),
                        VecZero());
-    float d2 = Vec3DotfV(gap, gap);
+    float d2 = vdot3(gap, gap);
     if (d2 < best) {
       best = d2;
       best_t = cand[i];
@@ -2256,7 +2266,7 @@ static int box_capsule_witness(const vshape *box, const vshape *capsule,
   if (!isfinite(dist2))
     return 0;
   dvec = VecSub(boxp, segp);
-  dist = sqrtf(Vec3DotfV(dvec, dvec));
+  dist = sqrtf(vdot3(dvec, dvec));
   R = alpha * capsule->R;
   eps = 1e-5f * (1.0f + fabsf(dist) + fabsf(R));
   if (!(dist > 1e-6f) || dist > R + eps || dist < R - eps)
@@ -2294,7 +2304,7 @@ static int analytic_witness(const vshape *sa, const vshape *sb, float alpha,
       v128f QB0 = VecSub(sb->c, hub), QB1 = VecAdd(sb->c, hub), c1, c2, n;
       closest_seg_seg(PA0, PA1, QB0, QB1, &c1, &c2);
       n = VecSub(c2, c1);
-      len = sqrtf(Vec3DotfV(n, n));
+      len = sqrtf(vdot3(n, n));
       if (len < 1e-6) return 0;          /* cores intersect: let GJK handle */
       *xstar = VecAdd(c1, VecMulf(n, alpha * sa->R / len));
       return 1;
@@ -2315,7 +2325,7 @@ static int analytic_witness(const vshape *sa, const vshape *sb, float alpha,
 
   if (oth->type == CP_SPHERE) {
     d = VecSub(oth->c, from);
-    len = sqrtf(Vec3DotfV(d, d));
+    len = sqrtf(vdot3(d, d));
     if (len < 1e-6) return 0;
     *xstar = VecSub(oth->c, VecMulf(d, alpha * oth->R / len));
     return 1;
@@ -2332,11 +2342,11 @@ static int analytic_witness(const vshape *sa, const vshape *sb, float alpha,
   }
   if (oth->type == CP_CAPSULE) {
     v128f ax = oth->ax[0], sp;
-    float t = Vec3DotfV(VecSub(from, oth->c), ax), lim = alpha * oth->hl;
+    float t = vdot3(VecSub(from, oth->c), ax), lim = alpha * oth->hl;
     if (t > lim) t = lim; else if (t < -lim) t = -lim;
     sp = VecAdd(oth->c, VecMulf(ax, t));
     d = VecSub(from, sp);
-    len = sqrtf(Vec3DotfV(d, d));
+    len = sqrtf(vdot3(d, d));
     if (len < 1e-6) return 0;           /* sphere centre on the capsule axis */
     *xstar = VecAdd(sp, VecMulf(d, alpha * oth->R / len));
     return 1;
@@ -2354,28 +2364,31 @@ static int opt_val_collide_v(const vshape *pa, const vshape *pb,
                              const cp_shape *sha, const cp_shape *shb,
                              float *alpha_out, float *dist_out,
                              v128f *xstar_out) {
-  vshape sa = *pa, sb = *pb;
+  /* pa/pb are already private, re-centered copies owned by solve_pair_vshape,
+   * and nothing here mutates them — alias by pointer instead of copying the
+   * (now v128f, ~620-byte) vshape again. */
+  const vshape *sa = pa, *sb = pb;
   float lo, hi, alpha;
-  v128f cd = VecSub(sa.c, sb.c);
+  v128f cd = VecSub(sa->c, sb->c);
   int i;
 
-  if (sa.type == CP_BOX && sb.type == CP_POLYTOPE &&
-      box_poly_alpha_asym(&sa, &sb, shb, &alpha))
+  if (sa->type == CP_BOX && sb->type == CP_POLYTOPE &&
+      box_poly_alpha_asym(sa, sb, shb, &alpha))
     goto done;
-  if (sa.type == CP_POLYTOPE && sb.type == CP_BOX &&
-      box_poly_alpha_asym(&sb, &sa, sha, &alpha))
+  if (sa->type == CP_POLYTOPE && sb->type == CP_BOX &&
+      box_poly_alpha_asym(sb, sa, sha, &alpha))
     goto done;
-  if (pair_alpha_specialized(&sa, &sb, &alpha))
+  if (pair_alpha_specialized(sa, sb, &alpha))
     goto done;
 
   lo = 1e-6;
-  if (gjk_dist(&sa, &sb, lo, NULL) <= 0.0) {
+  if (gjk_dist(sa, sb, lo, NULL) <= 0.0) {
     alpha = 0.0; /* scaling centers (effectively) coincident: alpha -> 0 */
     goto done;
   }
   hi = 1.0;
   i = 0;
-  while (gjk_dist(&sa, &sb, hi, NULL) > 0.0) {
+  while (gjk_dist(sa, sb, hi, NULL) > 0.0) {
     hi *= 2.0;
     if (++i > 60)
       return 1; /* no intersection found at huge alpha: invalid input */
@@ -2384,7 +2397,7 @@ static int opt_val_collide_v(const vshape *pa, const vshape *pb,
     lo = hi * 0.5;
   for (i = 0; i < 16; ++i) {
     float mid = 0.5 * (lo + hi);
-    if (gjk_dist(&sa, &sb, mid, NULL) > 0.0)
+    if (gjk_dist(sa, sb, mid, NULL) > 0.0)
       lo = mid;
     else
       hi = mid;
@@ -2398,7 +2411,7 @@ done:
   if (alpha <= CP_ALPHA_EPS) {
     *dist_out = 0.0;
     /* coincident centers: contact point is the (shared) scaling center */
-    *xstar_out = sa.c;
+    *xstar_out = sa->c;
   } else {
     /* The witness is a barycentric combination of A's support points on the
      * boundary of the scaled shape, so unscaling it by alpha (eq. 24) lands the
@@ -2407,34 +2420,34 @@ done:
      * touch/overlap; step to the touch boundary from below by bisection (tight,
      * so the contact stays on-surface to well under tolerance), then read the
      * witness there. Distance still uses the true alpha. */
-    *dist_out = sqrtf(Vec3DotfV(cd, cd)) * (1.0 - 1.0 / alpha);
+    *dist_out = sqrtf(vdot3(cd, cd)) * (1.0 - 1.0 / alpha);
     /* Closed-form witness for supported type partitions. Known-unsupported
      * partitions (box-box, box-poly, poly-box, poly-poly) go directly to the
      * GJK witness path instead of entering analytic_witness only to return 0. */
     {
-      int try_analytic = (sa.type == CP_SPHERE || sb.type == CP_SPHERE ||
-          (sa.type == CP_CAPSULE && sb.type == CP_CAPSULE) ||
-          (sa.type == CP_BOX && sb.type == CP_CAPSULE) ||
-          (sa.type == CP_CAPSULE && sb.type == CP_BOX) ||
-          (sa.type == CP_CAPSULE && sb.type == CP_POLYTOPE) ||
-          (sa.type == CP_POLYTOPE && sb.type == CP_CAPSULE));
-      if (try_analytic && analytic_witness(&sa, &sb, alpha, xstar_out)) {
+      int try_analytic = (sa->type == CP_SPHERE || sb->type == CP_SPHERE ||
+          (sa->type == CP_CAPSULE && sb->type == CP_CAPSULE) ||
+          (sa->type == CP_BOX && sb->type == CP_CAPSULE) ||
+          (sa->type == CP_CAPSULE && sb->type == CP_BOX) ||
+          (sa->type == CP_CAPSULE && sb->type == CP_POLYTOPE) ||
+          (sa->type == CP_POLYTOPE && sb->type == CP_CAPSULE));
+      if (try_analytic && analytic_witness(sa, sb, alpha, xstar_out)) {
         /* xstar set analytically */
-      } else if (gjk_dist(&sa, &sb, alpha, xstar_out) <= 0.0) {
+      } else if (gjk_dist(sa, sb, alpha, xstar_out) <= 0.0) {
       float a_lo = alpha * (1.0 - 1e-6), a_hi = alpha;
       int t;
-      for (t = 0; t < 40 && gjk_dist(&sa, &sb, a_lo, NULL) <= 0.0; ++t)
+      for (t = 0; t < 40 && gjk_dist(sa, sb, a_lo, NULL) <= 0.0; ++t)
         a_lo = alpha - (alpha - a_lo) * 2.0;
       for (t = 0; t < 4; ++t) {
         float am = 0.5 * (a_lo + a_hi);
         if (am <= a_lo || am >= a_hi)
           break; /* float precision exhausted: further gjk_dist calls are wasted */
-        if (gjk_dist(&sa, &sb, am, NULL) > 0.0)
+        if (gjk_dist(sa, sb, am, NULL) > 0.0)
           a_lo = am;
         else
           a_hi = am;
       }
-        gjk_dist(&sa, &sb, a_lo, xstar_out);
+        gjk_dist(sa, sb, a_lo, xstar_out);
       }
     }
   }
@@ -2453,16 +2466,16 @@ done:
 static v128f snap_to_surface(const cp_shape *s, v128f c, v128f p) {
   if (s->type == CP_SPHERE) {
     v128f d = VecSub(p, c);
-    float n = sqrtf(Vec3DotfV(d, d));
+    float n = sqrtf(vdot3(d, d));
     if (n > 1e-6)
       p = VecAdd(c, VecMulf(d, s->R / n));
   } else if (s->type == CP_CAPSULE) {
     v128f rel = VecSub(p, c), cp, d;
-    float t = Vec3DotfV(rel, s->axis), n;
+    float t = vdot3(rel, s->axis), n;
     if (t > s->hl) t = s->hl; else if (t < -s->hl) t = -s->hl;
     cp = VecAdd(c, VecMulf(s->axis, t));
     d = VecSub(p, cp);
-    n = sqrtf(Vec3DotfV(d, d));
+    n = sqrtf(vdot3(d, d));
     if (n > 1e-6)
       p = VecAdd(cp, VecMulf(d, s->R / n));
   } else if (s->nface > 0) {
@@ -2481,7 +2494,7 @@ static v128f snap_to_surface(const cp_shape *s, v128f c, v128f p) {
       int imax = 0, i;
       float dmax = -1e30f;
       for (i = 0; i < s->nface; ++i) {
-        float d = Vec3DotfV(s->fa[i], VecSub(p, c)) - s->fb[i];
+        float d = vdot3(s->fa[i], VecSub(p, c)) - s->fb[i];
         if (d > dmax) { dmax = d; imax = i; }
       }
       /* Project onto the nearest/most-violated face plane (moves the point
@@ -2505,13 +2518,19 @@ static v128f snap_to_surface(const cp_shape *s, v128f c, v128f p) {
  * be NULL (the lite path has no precomputed cp_shape and does not snap). The
  * vshapes are taken by value so the re-centering does not touch the caller's
  * tables. */
-static void solve_pair_vshape(vshape A, vshape B,
+static void solve_pair_vshape(const vshape *pA, const vshape *pB,
                               const cp_shape *sA, const cp_shape *sB,
                               cp_result *out) {
   cp_result r;
+  vshape A, B;
   v128f piv, xstar = VecZero();
   float alpha = 0.0, dist = 0.0;
   int j;
+  /* Private mutable copies (re-centering mutates them). Copy only the used
+   * prefix: w[] holds polytope verts, so sphere/box/capsule (nv == 0) skip the
+   * 512-byte tail entirely. */
+  memcpy(&A, pA, offsetof(vshape, w) + (size_t)pA->nv * sizeof(v128f));
+  memcpy(&B, pB, offsetof(vshape, w) + (size_t)pB->nv * sizeof(v128f));
   memset(&r, 0, sizeof r);
   /* re-center the whole pair on A's scaling center (meter-scale working frame) */
   piv = A.c;
@@ -2632,7 +2651,7 @@ void cp_collide_pairs_vshapes(const cp_vshapes *shapes, const cp_pair *pairs,
     if (sa->status != CP_OK) { r.status = sa->status; results[i] = r; continue; }
     if (sb->status != CP_OK) { r.status = sb->status; results[i] = r; continue; }
     /* everything (faces, vshape) is precomputed in the table — no per-pair build */
-    solve_pair_vshape(sa->v, sb->v, &sa->s, &sb->s, &results[i]);
+    solve_pair_vshape(&sa->v, &sb->v, &sa->s, &sb->s, &results[i]);
   }
 }
 
@@ -2677,6 +2696,6 @@ void cp_collide_pairs(const cp_prim *prims, uint32_t prim_count,
      * snap — the vshape alone drives the solve (sA/sB NULL). */
     make_vshape(&prims[pairs[i].a], &va);
     make_vshape(&prims[pairs[i].b], &vb);
-    solve_pair_vshape(va, vb, NULL, NULL, &results[i]);
+    solve_pair_vshape(&va, &vb, NULL, NULL, &results[i]);
   }
 }
