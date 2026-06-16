@@ -11,6 +11,13 @@
 
 CC      := gcc
 CFLAGS  := -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG
+# -march=native lets gcc emit 256-bit (ymm) spills with 32-byte-aligned vmovdqa,
+# but MinGW only guarantees a 16-byte-aligned stack and its 32-byte frame
+# realignment is unreliable -> intermittent SIGSEGV on a misaligned spill (a
+# pre-existing latent crash on this toolchain, ~50% of runs). Pinning the vector
+# width to 128 keeps every spill 16-byte (always aligned). Applies to the whole
+# optimized harness; the reference Makefile is unaffected.
+CFLAGS  += -mprefer-vector-width=128
 # The optimized solver is single-precision throughout. -fsingle-precision-constant
 # makes floating-point literals float (not double), so float expressions are not
 # promoted to double; -Wdouble-promotion (as error) enforces that no promotion
