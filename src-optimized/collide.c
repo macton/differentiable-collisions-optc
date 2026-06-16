@@ -136,10 +136,6 @@ static float d3dot(const float a[3], const float b[3]) {
   return vdot3(vld3(a), vld3(b));
 }
 
-static void d3cross(const float a[3], const float b[3], float o[3]) {
-  Vec3Store(o, Vec3Cross(vld3(a), vld3(b)));
-}
-
 /* rotation must be orthonormal (3e-3 tol) with det ~ +1 */
 static int rot_ok(const float rotf[9]) {
   float q[3][3];
@@ -176,34 +172,34 @@ static int rot_ok(const float rotf[9]) {
  * Returns 0 on degeneracy (flat cloud, center not strictly interior,
  * face overflow) -> caller rejects with CP_ERR_BAD_PRIM. O(n^4), run
  * once per primitive per batch, never inside the per-pair solve. */
-static int CP_UNUSED_FUNC poly_faces(int n, const float w[][3],
-                                     const float c[3], float scale,
-                                     cp_shape *s) {
+/* Verts are pre-loaded to v128f once by the caller (w[]); the O(n^4) face scan
+ * and O(n^2) edge scan then run register-resident with no per-access reload.
+ * vdot3 over VecSub matches the old scalar dot (same per-lane products, same
+ * add order); normalization uses VecDivf (per-lane divide) to match nm[i]/len. */
+static int CP_UNUSED_FUNC poly_faces(int n, const v128f *w, v128f c,
+                                     float scale, cp_shape *s) {
   const float tol = 1e-6 * (scale + 1.0);
+  const float lentol = 1e-6 * (scale * scale + 1.0);
+  const float btol = 1e-6 * (scale + 1.0);
   int i, j, k, m, f;
   s->nface = 0;
   for (i = 0; i < n; ++i) {
+    v128f wi = w[i];
     for (j = i + 1; j < n; ++j) {
+      v128f e1 = VecSub(w[j], wi);
       for (k = j + 1; k < n; ++k) {
-        float e1[3], e2[3], nm[3], len, dmax, dmin, b;
+        v128f e2 = VecSub(w[k], wi), nm;
+        float len, dmax, dmin, b;
         int face, dup;
-        for (m = 0; m < 3; ++m) {
-          e1[m] = w[j][m] - w[i][m];
-          e2[m] = w[k][m] - w[i][m];
-        }
-        d3cross(e1, e2, nm);
-        len = sqrtf(d3dot(nm, nm));
-        if (len <= 1e-6 * (scale * scale + 1.0))
+        nm = Vec3Cross(e1, e2);
+        len = sqrtf(vdot3(nm, nm));
+        if (len <= lentol)
           continue;
-        nm[0] /= len;
-        nm[1] /= len;
-        nm[2] /= len;
+        nm = VecDivf(nm, len);
         dmax = -1e30f;
         dmin = 1e30f;
         for (m = 0; m < n; ++m) {
-          float d = nm[0] * (w[m][0] - w[i][0])
-                   + nm[1] * (w[m][1] - w[i][1])
-                   + nm[2] * (w[m][2] - w[i][2]);
+          float d = vdot3(nm, VecSub(w[m], wi));
           if (d > dmax) dmax = d;
           if (d < dmin) dmin = d;
         }
@@ -211,25 +207,21 @@ static int CP_UNUSED_FUNC poly_faces(int n, const float w[][3],
         if (dmax <= tol) {
           face = 1;
         } else if (dmin >= -tol) {
-          nm[0] = -nm[0];
-          nm[1] = -nm[1];
-          nm[2] = -nm[2];
+          nm = VecNeg(nm);
           face = 1;
         }
         if (!face)
           continue;
         b = -1e30f;
         for (m = 0; m < n; ++m) {
-          float d = nm[0] * (w[m][0] - c[0])
-                   + nm[1] * (w[m][1] - c[1])
-                   + nm[2] * (w[m][2] - c[2]);
+          float d = vdot3(nm, VecSub(w[m], c));
           if (d > b) b = d;
         }
-        if (b < 1e-6 * (scale + 1.0))
+        if (b < btol)
           return 0; /* center not strictly interior */
         dup = 0;
         for (f = 0; f < s->nface; ++f) {
-          if (vdot3(vld3(nm), s->fa[f]) > 1.0 - 1e-6 &&
+          if (vdot3(nm, s->fa[f]) > 1.0 - 1e-6 &&
               fabsf(b - s->fb[f]) <= 1e-6 * (1.0 + b)) {
             dup = 1;
             break;
@@ -238,7 +230,7 @@ static int CP_UNUSED_FUNC poly_faces(int n, const float w[][3],
         if (!dup) {
           if (s->nface >= CP_MAX_FACES)
             return 0;
-          s->fa[s->nface] = vld3(nm);
+          s->fa[s->nface] = nm;
           s->fb[s->nface] = b;
           ++s->nface;
         }
@@ -248,18 +240,20 @@ static int CP_UNUSED_FUNC poly_faces(int n, const float w[][3],
   return s->nface >= 4;
 }
 
-static int CP_UNUSED_FUNC poly_edges(int n, const float w[][3],
+static int CP_UNUSED_FUNC poly_edges(int n, const v128f *w,
                                      float scale, cp_shape *s) {
   const float tol = 2e-5f * (scale + 1.0f);
   int i, j, f, e;
   s->nedge = 0;
   for (i = 0; i < n; ++i) {
+    v128f wi = w[i];
     for (j = i + 1; j < n; ++j) {
       int common = 0, dup = 0;
-      float dir[3], len;
+      v128f dir;
+      float len;
       for (f = 0; f < s->nface; ++f) {
-        float di = vdot3(s->fa[f], vld3(w[i])) - s->fb[f];
-        float dj = vdot3(s->fa[f], vld3(w[j])) - s->fb[f];
+        float di = vdot3(s->fa[f], wi) - s->fb[f];
+        float dj = vdot3(s->fa[f], w[j]) - s->fb[f];
         if (fabsf(di) <= tol && fabsf(dj) <= tol) {
           ++common;
           if (common >= 2)
@@ -268,17 +262,13 @@ static int CP_UNUSED_FUNC poly_edges(int n, const float w[][3],
       }
       if (common < 2)
         continue;
-      dir[0] = w[j][0] - w[i][0];
-      dir[1] = w[j][1] - w[i][1];
-      dir[2] = w[j][2] - w[i][2];
-      len = sqrtf(d3dot(dir, dir));
+      dir = VecSub(w[j], wi);
+      len = sqrtf(vdot3(dir, dir));
       if (len <= 1e-8f * (scale + 1.0f))
         continue;
-      dir[0] /= len;
-      dir[1] /= len;
-      dir[2] /= len;
+      dir = VecDivf(dir, len);
       for (e = 0; e < s->nedge; ++e) {
-        if (fabsf(vdot3(vld3(dir), s->edge[e])) > 1.0f - 1e-6f) {
+        if (fabsf(vdot3(dir, s->edge[e])) > 1.0f - 1e-6f) {
           dup = 1;
           break;
         }
@@ -286,7 +276,7 @@ static int CP_UNUSED_FUNC poly_edges(int n, const float w[][3],
       if (!dup) {
         if (s->nedge >= CP_MAX_POLY_EDGES)
           return 0;
-        s->edge[s->nedge] = vld3(dir);
+        s->edge[s->nedge] = dir;
         ++s->nedge;
       }
     }
@@ -380,7 +370,8 @@ static void CP_UNUSED_FUNC build_shape(const cp_prim *p, cp_shape *s) {
      * evaluates fa.(p - s->c) against the world centroid s->c. This is build-
      * stage work, excluded from the timed solve. */
     float w[CP_MAX_POLY_VERTS][3];   /* verts relative to the local centroid */
-    float lc[3], origin[3];          /* local centroid; fit origin (= 0)     */
+    v128f wv[CP_MAX_POLY_VERTS];     /* same, as v128f for the hull scans    */
+    float lc[3];                     /* local centroid                       */
     float scale;
     int n = (int)p->vert_count;
     if (n < 4 || n > CP_MAX_POLY_VERTS) {
@@ -410,19 +401,20 @@ static void CP_UNUSED_FUNC build_shape(const cp_prim *p, cp_shape *s) {
       lc[i] /= (float)n;
       c3[i] /= (float)n;
     }
-    for (j = 0; j < n; ++j)
+    for (j = 0; j < n; ++j) {
       for (i = 0; i < 3; ++i)
         w[j][i] -= lc[i];                         /* center on local centroid  */
+      wv[j] = vld3(w[j]);                          /* load once for the scans   */
+    }
     scale = 0.0f;
     for (i = 0; i < 3; ++i)
       if (mx[i] - mn[i] > scale)
         scale = mx[i] - mn[i];
-    origin[0] = origin[1] = origin[2] = 0.0f;
-    if (!poly_faces(n, w, origin, scale, s)) {
+    if (!poly_faces(n, wv, VecZero(), scale, s)) { /* fit origin = 0 */
       s->status = CP_ERR_BAD_PRIM;
       return;
     }
-    if (!poly_edges(n, w, scale, s)) {
+    if (!poly_edges(n, wv, scale, s)) {
       s->status = CP_ERR_BAD_PRIM;
       return;
     }
