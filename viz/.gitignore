@@ -1,0 +1,7 @@
+# Regenerable data (copied/produced by the build + harness runs); the source
+# of truth is performance-test/pairs.txt and the perf harnesses. The visualizer
+# itself (index.html, shoot.mjs, vendor/) is the committed artifact.
+pairs.txt
+results_ref.txt
+results_opt.txt
+shots/

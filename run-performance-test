@@ -1,0 +1,31 @@
+#!/bin/sh
+# run-performance-test — build tools, build the split binary input from the
+# committed text set, run the reference harness on shapes.bin + pairs.bin, and
+# write performance-test/results.txt.
+#
+# The committed input performance-test/pairs.txt is static and read-only; the
+# split .bin files are derived build artifacts under build/. We verify via
+# sha256 that the run did not modify the committed text.
+set -e
+cd "$(dirname "$0")"
+
+make -s all
+
+if [ ! -f performance-test/pairs.txt ]; then
+    echo "performance input missing; generating once (not part of the timed run)"
+    ./build/perf_gen performance-test/pairs.txt
+fi
+
+# build step: pairs.txt -> build/shapes.bin + build/pairs.bin (excluded from timing)
+make -s input
+
+before=$(sha256sum performance-test/pairs.txt | cut -d' ' -f1)
+./build/perf_harness build/shapes.bin build/pairs.bin performance-test/results.txt
+after=$(sha256sum performance-test/pairs.txt | cut -d' ' -f1)
+
+if [ "$before" != "$after" ]; then
+    echo "ERROR: committed input performance-test/pairs.txt was modified by the run" >&2
+    exit 1
+fi
+echo "input data checksum unchanged: $before"
+echo "results: performance-test/results.txt"

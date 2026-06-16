@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>collide pair visualizer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0e1116; color: #d7dde6;
+               font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  #app { position: fixed; inset: 0; }
+  #panel { position: fixed; top: 10px; left: 10px; width: 340px; z-index: 10;
+           background: rgba(18,22,28,0.92); border: 1px solid #2a313c; border-radius: 8px;
+           padding: 12px 14px; }
+  #panel h1 { font-size: 14px; margin: 0 0 8px; color: #fff; }
+  #panel .row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+  #panel input[type=number] { width: 70px; background: #0e1116; color: #d7dde6;
+           border: 1px solid #2a313c; border-radius: 4px; padding: 3px 5px; }
+  #panel button { background: #1f2630; color: #d7dde6; border: 1px solid #2a313c;
+           border-radius: 4px; padding: 3px 9px; cursor: pointer; }
+  #panel button:hover { background: #2a313c; }
+  table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+  td { padding: 2px 4px; vertical-align: top; }
+  td.k { color: #8b97a7; white-space: nowrap; }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+        margin-right: 5px; vertical-align: middle; }
+  .colliding { color: #ff6b6b; font-weight: bold; }
+  .separated { color: #5ad17e; font-weight: bold; }
+  #hint { position: fixed; bottom: 8px; left: 10px; color: #5b6471; z-index: 10; }
+  #err { color: #ff6b6b; margin-top: 6px; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.js" } }
+</script>
+</head>
+<body>
+<div id="app"></div>
+<div id="panel">
+  <h1>collide pair visualizer</h1>
+  <div class="row">
+    <button id="prev">◀</button>
+    <span>pair</span>
+    <input id="idx" type="number" min="0" value="0">
+    <span id="count">/ ?</span>
+    <button id="next">▶</button>
+    <button id="fit">frame</button>
+  </div>
+  <table id="info"></table>
+  <div id="err"></div>
+</div>
+<div id="hint">drag: orbit &nbsp;·&nbsp; scroll: zoom &nbsp;·&nbsp; right-drag: pan &nbsp;·&nbsp; ←/→: prev/next pair</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from './vendor/OrbitControls.js';
+import { ConvexGeometry } from './vendor/ConvexGeometry.js';
+
+const TYPE_NAME = ['sphere', 'box', 'capsule', 'polytope'];
+
+// ---- data transforms: text -> typed records ----------------------------
+function parsePairs(text) {
+  const prims = [], pairs = [];
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    const t = line.split(/\s+/);
+    if (t[0] === 'PRIM') {
+      const n = t.map(Number);
+      const type = n[1];
+      const pos = [n[2], n[3], n[4]];
+      const rot = n.slice(5, 14);           // row-major 3x3, world = rot * body
+      const radius = n[14], length = n[15];
+      const he = [n[16], n[17], n[18]];
+      const vcount = n[19];
+      const verts = [];
+      for (let k = 0; k < vcount; k++)
+        verts.push([n[20 + 3 * k], n[21 + 3 * k], n[22 + 3 * k]]);
+      prims.push({ type, pos, rot, radius, length, he, verts });
+    } else if (t[0] === 'PAIR') {
+      pairs.push([+t[1], +t[2]]);
+    }
+  }
+  return { prims, pairs };
+}
+
+function parseResults(text) {
+  const out = [];
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    const t = line.split(/\s+/).map(Number);
+    // idx flag dist alpha p1xyz p2xyz
+    out[t[0]] = { flag: t[1], dist: t[2], alpha: t[3],
+                  p1: [t[4], t[5], t[6]], p2: [t[7], t[8], t[9]] };
+  }
+  return out;
+}
+
+// rot (row-major, world = rot*body) + pos -> THREE.Matrix4 (about a pivot)
+function primMatrix(p, pivot) {
+  const r = p.rot;
+  const m = new THREE.Matrix4();
+  m.set(
+    r[0], r[1], r[2], p.pos[0] - pivot[0],
+    r[3], r[4], r[5], p.pos[1] - pivot[1],
+    r[6], r[7], r[8], p.pos[2] - pivot[2],
+    0, 0, 0, 1);
+  return m;
+}
+function worldVert(p, v, pivot) {
+  const r = p.rot;
+  return new THREE.Vector3(
+    r[0] * v[0] + r[1] * v[1] + r[2] * v[2] + p.pos[0] - pivot[0],
+    r[3] * v[0] + r[4] * v[1] + r[5] * v[2] + p.pos[1] - pivot[1],
+    r[6] * v[0] + r[7] * v[1] + r[8] * v[2] + p.pos[2] - pivot[2]);
+}
+
+function buildPrimMesh(p, pivot, color) {
+  let geo;
+  if (p.type === 0) {                       // sphere
+    geo = new THREE.SphereGeometry(p.radius, 48, 32);
+  } else if (p.type === 1) {                // box
+    geo = new THREE.BoxGeometry(2 * p.he[0], 2 * p.he[1], 2 * p.he[2]);
+  } else if (p.type === 2) {                // capsule: solver axis = local +X
+    geo = new THREE.CapsuleGeometry(p.radius, p.length, 12, 32);
+    geo.rotateZ(-Math.PI / 2);              // three's +Y capsule axis -> +X
+  } else {                                  // polytope: hull of world verts
+    const pts = p.verts.map(v => worldVert(p, v, pivot));
+    geo = new ConvexGeometry(pts);
+  }
+  const grp = new THREE.Group();
+  const solid = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+    color, transparent: true, opacity: 0.32, roughness: 0.6, metalness: 0.0,
+    depthWrite: false, side: THREE.DoubleSide }));
+  const wire = new THREE.LineSegments(new THREE.WireframeGeometry(geo),
+    new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.5 }));
+  grp.add(solid); grp.add(wire);
+  if (p.type !== 3) {                       // poly geo is already in world space
+    const m = primMatrix(p, pivot);
+    grp.applyMatrix4(m);
+  }
+  return grp;
+}
+
+function marker(pos, color, r) {
+  const m = new THREE.Mesh(new THREE.SphereGeometry(r, 20, 16),
+    new THREE.MeshBasicMaterial({ color }));
+  m.position.set(pos[0], pos[1], pos[2]);
+  return m;
+}
+
+// ---- scene -------------------------------------------------------------
+const app = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+app.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0e1116);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.001, 1e6);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xbcd3ff, 0x202830, 1.1));
+const dir = new THREE.DirectionalLight(0xffffff, 1.6); dir.position.set(3, 5, 4); scene.add(dir);
+const grid = new THREE.GridHelper(40, 40, 0x2a313c, 0x1a2029); scene.add(grid);
+const axes = new THREE.AxesHelper(2); scene.add(axes);
+let pairGroup = new THREE.Group(); scene.add(pairGroup);
+
+function resize() {
+  const w = app.clientWidth, h = app.clientHeight;
+  renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+(function loop() {
+  requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera);
+})();
+
+// ---- state + rendering one pair ---------------------------------------
+const COL = { a: 0x4aa3ff, b: 0xffb14a, ref: 0x5ad17e, opt: 0xff5bb0, dist: 0xfff27a };
+let DATA = null, REF = null, OPT = null, cur = 0;
+
+function setErr(msg) { document.getElementById('err').textContent = msg || ''; }
+
+function fitCamera(box) {
+  const c = new THREE.Vector3(), s = new THREE.Vector3();
+  box.getCenter(c); box.getSize(s);
+  const radius = 0.5 * Math.max(s.x, s.y, s.z, 1e-3);
+  const d = radius / Math.sin(THREE.MathUtils.degToRad(camera.fov) / 2) * 1.7;
+  controls.target.copy(c);
+  camera.position.copy(c).add(new THREE.Vector3(1, 0.75, 1).normalize().multiplyScalar(d + radius));
+  camera.near = Math.max(d * 0.001, 1e-4); camera.far = (d + radius) * 10;
+  camera.updateProjectionMatrix(); controls.update();
+}
+
+function showPair(i) {
+  if (!DATA) return;
+  i = Math.max(0, Math.min(DATA.pairs.length - 1, i | 0));
+  cur = i;
+  document.getElementById('idx').value = i;
+  scene.remove(pairGroup);
+  pairGroup = new THREE.Group(); scene.add(pairGroup);
+  const [ia, ib] = DATA.pairs[i];
+  const A = DATA.prims[ia], B = DATA.prims[ib];
+  // pivot at midpoint of the two body origins -> keep geometry near origin
+  const pivot = [(A.pos[0] + B.pos[0]) / 2, (A.pos[1] + B.pos[1]) / 2, (A.pos[2] + B.pos[2]) / 2];
+  pairGroup.add(buildPrimMesh(A, pivot, COL.a));
+  pairGroup.add(buildPrimMesh(B, pivot, COL.b));
+
+  const sub = p => [p[0] - pivot[0], p[1] - pivot[1], p[2] - pivot[2]];
+  // marker radius scaled to the scene so it is visible but not dominant
+  const box0 = new THREE.Box3().setFromObject(pairGroup);
+  const span = box0.getSize(new THREE.Vector3()).length();
+  const mr = Math.max(span * 0.012, 1e-3);
+
+  const rr = REF && REF[i], oo = OPT && OPT[i];
+  if (rr) {
+    const p1 = sub(rr.p1), p2 = sub(rr.p2);
+    pairGroup.add(marker(p1, COL.ref, mr));
+    pairGroup.add(marker(p2, COL.ref, mr));
+    const line = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(
+        [new THREE.Vector3(...p1), new THREE.Vector3(...p2)]),
+      new THREE.LineDashedMaterial({ color: COL.dist, dashSize: mr, gapSize: mr * 0.6 }));
+    line.computeLineDistances();
+    pairGroup.add(line);
+  }
+  if (oo) {
+    pairGroup.add(marker(sub(oo.p1), COL.opt, mr * 0.66));
+    pairGroup.add(marker(sub(oo.p2), COL.opt, mr * 0.66));
+  }
+
+  fitCamera(new THREE.Box3().setFromObject(pairGroup));
+  renderInfo(i, A, B, rr, oo);
+  setErr('');
+}
+
+function fmt(x, n = 4) { return (x === undefined || x === null) ? '—' : (+x).toFixed(n); }
+function pdev(a, b) {
+  if (!a || !b) return undefined;
+  const dx = a[0]-b[0], dy = a[1]-b[1], dz = a[2]-b[2];
+  return Math.sqrt(dx*dx + dy*dy + dz*dz) * 1000; // mm
+}
+
+function renderInfo(i, A, B, rr, oo) {
+  const flag = rr ? rr.flag : (oo ? oo.flag : null);
+  const state = flag === 1 ? '<span class="colliding">COLLIDING</span>'
+              : flag === 0 ? '<span class="separated">separated</span>' : '—';
+  const d1 = pdev(rr && rr.p1, oo && oo.p1), d2 = pdev(rr && rr.p2, oo && oo.p2);
+  const rows = [
+    ['pair', `${i} &nbsp; (prims ${DATA.pairs[i][0]}, ${DATA.pairs[i][1]})`],
+    ['shapes', `<span class="sw" style="background:#4aa3ff"></span>${TYPE_NAME[A.type]} &nbsp; `
+             + `<span class="sw" style="background:#ffb14a"></span>${TYPE_NAME[B.type]}`],
+    ['state', state],
+    ['ref dist', rr ? fmt(rr.dist) + ' m' : '—'],
+    ['opt dist', oo ? fmt(oo.dist) + ' m' : '—'],
+    ['dist Δ', (rr && oo) ? fmt(Math.abs(rr.dist - oo.dist) * 1000, 3) + ' mm' : '—'],
+    ['legend', '<span class="sw" style="background:#5ad17e"></span>ref contact &nbsp; '
+             + '<span class="sw" style="background:#ff5bb0"></span>opt contact'],
+    ['contact Δ', (d1 !== undefined) ? `p1 ${fmt(d1,3)} mm, p2 ${fmt(d2,3)} mm` : '—'],
+    ['|origin|', fmt(Math.hypot(A.pos[0], A.pos[1], A.pos[2]), 1) + ' m'],
+  ];
+  document.getElementById('info').innerHTML =
+    rows.map(([k, v]) => `<tr><td class="k">${k}</td><td>${v}</td></tr>`).join('');
+}
+
+// ---- loading -----------------------------------------------------------
+async function fetchText(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+  return r.text();
+}
+function applyLoaded() {
+  document.getElementById('count').textContent = '/ ' + (DATA ? DATA.pairs.length - 1 : '?');
+  document.getElementById('idx').max = DATA ? DATA.pairs.length - 1 : 0;
+  const q = new URLSearchParams(location.search);
+  const start = q.has('pair') ? +q.get('pair') : cur;
+  showPair(start);
+}
+
+async function loadDefaults() {
+  try {
+    const [a, b, c] = await Promise.all([
+      fetchText('./pairs.txt'),
+      fetchText('./results_ref.txt').catch(() => null),
+      fetchText('./results_opt.txt').catch(() => null),
+    ]);
+    DATA = parsePairs(a);
+    REF = b ? parseResults(b) : null;
+    OPT = c ? parseResults(c) : null;
+    applyLoaded();
+  } catch (e) { setErr('load: ' + e.message); }
+}
+
+// ---- wiring ------------------------------------------------------------
+document.getElementById('prev').onclick = () => showPair(cur - 1);
+document.getElementById('next').onclick = () => showPair(cur + 1);
+document.getElementById('fit').onclick = () => showPair(cur);
+document.getElementById('idx').onchange = e => showPair(+e.target.value);
+addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft') showPair(cur - 1);
+  if (e.key === 'ArrowRight') showPair(cur + 1);
+});
+window.__ready = false;
+loadDefaults().then(() => { window.__ready = true; });
+</script>
+</body>
+</html>

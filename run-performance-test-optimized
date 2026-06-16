@@ -1,0 +1,36 @@
+#!/bin/sh
+# run-performance-test-optimized — build tools, build the split binary input,
+# run the optimized build-stage transforms, and run the OPTIMIZED harness on
+# the transformed inputs (shapes_optimized.bin + pairs_optimized.bin). Writes
+# performance-test-optimized/results.txt.
+#
+# Pipeline (all build steps below are excluded from the reported time):
+#   pairs.txt --build_input--> build/{shapes,pairs}.bin
+#   build/shapes.bin --build_optimized_shapes--> build/shapes_optimized.bin
+#   build/pairs.bin  --build_optimized_pairs --> build/pairs_optimized.bin
+set -e
+cd "$(dirname "$0")"
+
+make -s all                         # reference tools incl. build_input
+make -f Makefile.optimized -s optimized
+
+if [ ! -f performance-test/pairs.txt ]; then
+    echo "ERROR: committed input performance-test/pairs.txt missing" >&2
+    exit 1
+fi
+
+# build steps: text -> split bins -> optimized bins
+make -s input
+make -f Makefile.optimized -s optinput
+
+before=$(sha256sum performance-test/pairs.txt | cut -d' ' -f1)
+./build/perf_harness_opt build/shapes_optimized.bin build/pairs_optimized.bin \
+    performance-test-optimized/results.txt
+after=$(sha256sum performance-test/pairs.txt | cut -d' ' -f1)
+
+if [ "$before" != "$after" ]; then
+    echo "ERROR: committed input performance-test/pairs.txt was modified by the run" >&2
+    exit 1
+fi
+echo "input data checksum unchanged: $before"
+echo "results: performance-test-optimized/results.txt"

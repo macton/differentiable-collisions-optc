@@ -1,0 +1,120 @@
+# Makefile.optimized — optimized-harness build targets.
+# Separate from the reference Makefile; changes NO existing reference target.
+# Same flags as reference: -std=c11 -Wall -Wextra -Werror -O3 -march=native
+# -DNDEBUG, libc/libm only. (Reference and optimized share flags so the speedup
+# ratio is honest — both get the same compiler optimization.)
+#
+#   make -f Makefile.optimized optimized
+#
+# Builds into build/ under DISTINCT object/binary names so reference and
+# optimized artifacts never collide.
+
+CC      := gcc
+CFLAGS  := -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG
+# The optimized solver is single-precision throughout. -fsingle-precision-constant
+# makes floating-point literals float (not double), so float expressions are not
+# promoted to double; -Wdouble-promotion (as error) enforces that no promotion
+# sneaks back in. Applied ONLY to collide_opt.o — never to the double reference.
+OPT_FP  := -fsingle-precision-constant -Wdouble-promotion -fno-math-errno -fno-signed-zeros
+LDLIBS  := -lm
+B       := build
+
+.PHONY: optimized clean-optimized optinput
+optimized: $(B)/test_runner_opt $(B)/perf_harness_opt $(B)/perf_validate_opt \
+           $(B)/perf_gen_seed $(B)/compare_results $(B)/validate_contacts \
+           $(B)/build_optimized_shapes $(B)/build_optimized_pairs
+
+$(B):
+	mkdir -p $(B)
+
+# Optimized library object — single precision (see OPT_FP).
+$(B)/collide_opt.o: src-optimized/collide.c src-optimized/collide.h | $(B)
+	$(CC) $(CFLAGS) $(OPT_FP) -c src-optimized/collide.c -o $@
+
+# Independent validator, compiled for optimized linkage (distinct object name;
+# source is the shared reference test/validator.c, unchanged).
+$(B)/validator_opt.o: test/validator.c test/validator.h src/collide.h | $(B)
+	$(CC) $(CFLAGS) -c test/validator.c -o $@
+
+# Pair text I/O for the optimized harness (its include resolves src-optimized).
+$(B)/pairs_io_opt.o: performance-test-optimized/pairs_io.c \
+                     performance-test-optimized/pairs_io.h \
+                     src-optimized/collide.h | $(B)
+	$(CC) $(CFLAGS) -c performance-test-optimized/pairs_io.c -o $@
+
+# Full reference correctness suite run against the optimized library: the
+# reference test/test_main.c + test/validator.c, linked to collide_opt.o.
+$(B)/test_runner_opt: test/test_main.c test/validator.h src/collide.h \
+                      $(B)/collide_opt.o $(B)/validator_opt.o
+	$(CC) $(CFLAGS) test/test_main.c $(B)/collide_opt.o $(B)/validator_opt.o \
+	    -o $@ $(LDLIBS)
+
+# Optimized timing harness.
+$(B)/perf_harness_opt: performance-test-optimized/perf_main.c \
+                       performance-test-optimized/pairs_io.h bin_format.h \
+                       $(B)/collide_opt.o $(B)/pairs_io_opt.o
+	$(CC) $(CFLAGS) performance-test-optimized/perf_main.c \
+	    $(B)/collide_opt.o $(B)/pairs_io_opt.o -o $@ $(LDLIBS)
+
+# Optimized independent-validator harness.
+$(B)/perf_validate_opt: performance-test-optimized/validate_main.c \
+                        performance-test-optimized/pairs_io.h test/validator.h \
+                        $(B)/collide_opt.o $(B)/validator_opt.o \
+                        $(B)/pairs_io_opt.o
+	$(CC) $(CFLAGS) performance-test-optimized/validate_main.c \
+	    $(B)/collide_opt.o $(B)/validator_opt.o $(B)/pairs_io_opt.o \
+	    -o $@ $(LDLIBS)
+
+# Reference library object, used ONLY by the generalization generator below so
+# alternate input sets are validated by the REFERENCE solver (the ground truth).
+# Generating with the optimized solver can emit pairs the reference cannot
+# converge on, which makes the reference harness abort and leaves no baseline.
+$(B)/collide_ref.o: src/collide.c src/collide.h | $(B)
+	$(CC) $(CFLAGS) -c src/collide.c -o $@
+
+# Alternate-seed generator for the generalization check. Linked against the
+# reference solver (collide_ref.o) so every generated set is reference-valid
+# and both harnesses can run it.
+$(B)/perf_gen_seed: performance-test-optimized/gen_pairs_seed.c \
+                    performance-test-optimized/pairs_io.h \
+                    $(B)/collide_ref.o $(B)/pairs_io_opt.o
+	$(CC) $(CFLAGS) performance-test-optimized/gen_pairs_seed.c \
+	    $(B)/collide_ref.o $(B)/pairs_io_opt.o -o $@ $(LDLIBS)
+
+# Results-file tolerance comparator (pure data transform; libm for fabs).
+$(B)/compare_results: performance-test-optimized/compare_results.c | $(B)
+	$(CC) $(CFLAGS) performance-test-optimized/compare_results.c -o $@ $(LDLIBS)
+
+# Independent contact-point validity certifier (shares no solver code).
+$(B)/validate_contacts: performance-test-optimized/validate_contacts.c \
+                        src/collide.h bin_format.h | $(B)
+	$(CC) $(CFLAGS) performance-test-optimized/validate_contacts.c -o $@ $(LDLIBS)
+
+# Optimized build-stage transforms. Each sees ONLY one half of the input
+# (shapes XOR pairs), so neither can precompute a collision answer. No collide
+# object is linked: they only need the struct sizes from the header.
+$(B)/build_optimized_shapes: performance-test-optimized/build_optimized_shapes.c \
+                             src-optimized/collide.h bin_format.h $(B)/collide_opt.o
+	$(CC) $(CFLAGS) performance-test-optimized/build_optimized_shapes.c \
+	    $(B)/collide_opt.o -o $@ $(LDLIBS)
+
+$(B)/build_optimized_pairs: performance-test-optimized/build_optimized_pairs.c \
+                            src-optimized/collide.h bin_format.h | $(B)
+	$(CC) $(CFLAGS) performance-test-optimized/build_optimized_pairs.c -o $@ $(LDLIBS)
+
+# Build step: transform the split input into the optimized input the optimized
+# runtime consumes. Reads $(OUT_PREFIX)shapes.bin / pairs.bin (produced by the
+# reference `make input`), writes $(OUT_PREFIX){shapes,pairs}_optimized.bin.
+OUT_PREFIX ?= $(B)/
+optinput: $(B)/build_optimized_shapes $(B)/build_optimized_pairs
+	$(B)/build_optimized_shapes $(OUT_PREFIX)shapes.bin $(OUT_PREFIX)shapes_optimized.bin
+	$(B)/build_optimized_pairs  $(OUT_PREFIX)pairs.bin  $(OUT_PREFIX)pairs_optimized.bin
+
+clean-optimized:
+	rm -f $(B)/collide_opt.o $(B)/collide_ref.o $(B)/validator_opt.o $(B)/pairs_io_opt.o \
+	      $(B)/test_runner_opt $(B)/perf_harness_opt $(B)/perf_validate_opt \
+	      $(B)/perf_gen_seed $(B)/compare_results \
+	      $(B)/build_optimized_shapes $(B)/build_optimized_pairs \
+	      $(B)/shapes.bin $(B)/pairs.bin \
+	      $(B)/shapes_optimized.bin $(B)/pairs_optimized.bin \
+	      $(B)/pairs_opt.bin

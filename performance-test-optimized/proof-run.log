@@ -1,0 +1,386 @@
+================================================================
+ PROVE OPTIMIZED HARNESS — optimized library vs reference (split-input)
+ date: 2026-06-16T06:46:13Z
+================================================================
+
+### source under test: src-optimized/
+  src-optimized differs from the reference — a real optimization is under test.
+committed input sha256 (before): 9bd4939dc3d6c7d66459fe064768bf2d904b59410c4d8929107c9264c96dd555
+
+### STEP 1: clean build of reference + optimized (-Wall -Wextra -Werror)
+$ make clean
+rm -rf build
+$ make all
+mkdir -p build
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG -c src/collide.c -o build/collide.o
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG -c test/validator.c -o build/validator.o
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG test/test_main.c build/collide.o build/validator.o -o build/test_runner -lm
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG -c performance-test/pairs_io.c -o build/pairs_io.o
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG performance-test/gen_pairs.c build/collide.o build/pairs_io.o -o build/perf_gen -lm
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG performance-test/perf_main.c build/collide.o build/pairs_io.o -o build/perf_harness -lm
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG performance-test/validate_main.c build/collide.o build/validator.o build/pairs_io.o -o build/perf_validate -lm
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG performance-test/build_input.c build/collide.o build/pairs_io.o -o build/build_input -lm
+$ make -f Makefile.optimized optimized
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG -fsingle-precision-constant -Wdouble-promotion -fno-math-errno -fno-signed-zeros -c src-optimized/collide.c -o build/collide_opt.o
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG -c test/validator.c -o build/validator_opt.o
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG test/test_main.c build/collide_opt.o build/validator_opt.o \
+    -o build/test_runner_opt -lm
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG -c performance-test-optimized/pairs_io.c -o build/pairs_io_opt.o
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG performance-test-optimized/perf_main.c \
+    build/collide_opt.o build/pairs_io_opt.o -o build/perf_harness_opt -lm
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG performance-test-optimized/validate_main.c \
+    build/collide_opt.o build/validator_opt.o build/pairs_io_opt.o \
+    -o build/perf_validate_opt -lm
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG -c src/collide.c -o build/collide_ref.o
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG performance-test-optimized/gen_pairs_seed.c \
+    build/collide_ref.o build/pairs_io_opt.o -o build/perf_gen_seed -lm
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG performance-test-optimized/compare_results.c -o build/compare_results -lm
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG performance-test-optimized/validate_contacts.c -o build/validate_contacts -lm
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG performance-test-optimized/build_optimized_shapes.c \
+    build/collide_opt.o -o build/build_optimized_shapes -lm
+gcc -std=c11 -Wall -Wextra -Werror -O3 -march=native -DNDEBUG performance-test-optimized/build_optimized_pairs.c -o build/build_optimized_pairs -lm
+
+### STEP 2: build-stage input pipeline (txt -> split bins -> optimized bins)
+$ make input
+build/build_input performance-test/pairs.txt build/shapes.bin build/pairs.bin
+$ make -f Makefile.optimized optinput
+build/build_optimized_shapes build/shapes.bin build/shapes_optimized.bin
+build/build_optimized_pairs  build/pairs.bin  build/pairs_optimized.bin
+  total precompute time: 0.021 s (limit 3600 s; excluded from runtime cost)
+  isolation: build_optimized_shapes sees only shapes; build_optimized_pairs sees only pairs;
+  neither sees both, so the build stage cannot precompute collision answers.
+
+### STEP 3: reference harness on shapes.bin + pairs.bin
+$ ./build/perf_harness build/shapes.bin build/pairs.bin performance-test/results.txt
+total collision time: 0.275922 s (1000 pairs, single thread)
+
+### STEP 4: optimized harness on shapes_optimized.bin + pairs_optimized.bin
+$ ./build/perf_harness_opt build/shapes_optimized.bin build/pairs_optimized.bin performance-test-optimized/results.txt
+total collision time: 0.002809 s (1000 pairs, single thread)
+
+### STEP 5: compare_results (count + hybrid 1mm+0.1%+cond distance tol, NOT a diff)
+$ ./build/compare_results performance-test/results.txt performance-test-optimized/results.txt
+pairs 1000
+ref_collisions 756
+opt_collisions 756
+flag_mismatches 0
+max_distance_diff_mm 5.259000
+max_distance_diff_rel_pct 2.280758
+distance_tol abs 1.0000 mm + rel 0.100 % + cond 5.0e-04*|c1-c2|/alpha^2
+pairs_over_tolerance 0
+max_contact_diff_mm 317.617192
+contacts_matching_reference 693
+PASS
+
+### STEP 5b: validate_contacts (independent geometric certifier)
+  -- reference output (ground-truth baseline) --
+$ ./build/validate_contacts build/shapes.bin build/pairs.bin performance-test/results.txt
+pairs_checked 1000
+valid_contacts 1000
+invalid_contacts 0
+max_surface_dev_mm 0.346259
+max_separation_error_mm 0.512372
+PASS
+  -- optimized output --
+$ ./build/validate_contacts build/shapes.bin build/pairs.bin performance-test-optimized/results.txt
+pairs_checked 1000
+valid_contacts 1000
+invalid_contacts 0
+max_surface_dev_mm 0.737154
+max_separation_error_mm 4.128762
+PASS
+
+### STEP 6: full reference correctness suite against the optimized library
+$ ./build/test_runner_opt
+PASS sphere-sphere-sep            status CP_OK
+PASS sphere-sphere-sep            distance 1.000000 vs analytic 1.000000
+PASS sphere-sphere-sep            alpha 1.500000 vs analytic 1.500000
+PASS sphere-sphere-sep            colliding flag matches distance sign
+PASS sphere-sphere-sep            validator ran
+PASS sphere-sphere-sep            validator dist 1.000000 vs primary 1.000000
+PASS sphere-sphere-touch          status CP_OK
+PASS sphere-sphere-touch          distance 0.000000 vs analytic 0.000000
+PASS sphere-sphere-touch          alpha 1.000000 vs analytic 1.000000
+PASS sphere-sphere-touch          validator ran
+PASS sphere-sphere-touch          validator dist -0.000000 vs primary 0.000000
+PASS sphere-sphere-deep           status CP_OK
+PASS sphere-sphere-deep           distance -1.500000 vs analytic -1.500000
+PASS sphere-sphere-deep           alpha 0.250000 vs analytic 0.250000
+PASS sphere-sphere-deep           colliding flag matches distance sign
+PASS sphere-sphere-deep           validator ran
+PASS sphere-sphere-deep           validator dist -1.500000 vs primary -1.500000
+PASS box-box-sep                  status CP_OK
+PASS box-box-sep                  distance 2.000000 vs analytic 2.000000
+PASS box-box-sep                  alpha 2.000000 vs analytic 2.000000
+PASS box-box-sep                  colliding flag matches distance sign
+PASS box-box-sep                  validator ran
+PASS box-box-sep                  validator dist 2.000000 vs primary 2.000000
+PASS box-box-touch                status CP_OK
+PASS box-box-touch                distance 0.000000 vs analytic 0.000000
+PASS box-box-touch                alpha 1.000000 vs analytic 1.000000
+PASS box-box-touch                validator ran
+PASS box-box-touch                validator dist -0.000000 vs primary 0.000000
+PASS box-box-deep                 status CP_OK
+PASS box-box-deep                 distance -1.800000 vs analytic -1.800000
+PASS box-box-deep                 alpha 0.100000 vs analytic 0.100000
+PASS box-box-deep                 colliding flag matches distance sign
+PASS box-box-deep                 validator ran
+PASS box-box-deep                 validator dist -1.800000 vs primary -1.800000
+PASS sphere-box-sep               status CP_OK
+PASS sphere-box-sep               distance 1.500000 vs analytic 1.500000
+PASS sphere-box-sep               alpha 2.000000 vs analytic 2.000000
+PASS sphere-box-sep               colliding flag matches distance sign
+PASS sphere-box-sep               validator ran
+PASS sphere-box-sep               validator dist 1.500000 vs primary 1.500000
+PASS sphere-box-touch             status CP_OK
+PASS sphere-box-touch             distance 0.000000 vs analytic 0.000000
+PASS sphere-box-touch             alpha 1.000000 vs analytic 1.000000
+PASS sphere-box-touch             validator ran
+PASS sphere-box-touch             validator dist -0.000000 vs primary 0.000000
+PASS sphere-box-pen               status CP_OK
+PASS sphere-box-pen               distance -0.300000 vs analytic -0.300000
+PASS sphere-box-pen               alpha 0.800000 vs analytic 0.800000
+PASS sphere-box-pen               colliding flag matches distance sign
+PASS sphere-box-pen               validator ran
+PASS sphere-box-pen               validator dist -0.300000 vs primary -0.300000
+PASS capsule-capsule-sep          status CP_OK
+PASS capsule-capsule-sep          distance 1.999995 vs analytic 2.000000
+PASS capsule-capsule-sep          alpha 2.999985 vs analytic 3.000000
+PASS capsule-capsule-sep          colliding flag matches distance sign
+PASS capsule-capsule-sep          validator ran
+PASS capsule-capsule-sep          validator dist 2.000000 vs primary 1.999995
+PASS capsule-capsule-touch        status CP_OK
+PASS capsule-capsule-touch        distance -0.000006 vs analytic 0.000000
+PASS capsule-capsule-touch        alpha 0.999994 vs analytic 1.000000
+PASS capsule-capsule-touch        validator ran
+PASS capsule-capsule-touch        validator dist -0.000000 vs primary -0.000006
+PASS capsule-capsule-deep         status CP_OK
+PASS capsule-capsule-deep         distance -0.500008 vs analytic -0.500000
+PASS capsule-capsule-deep         alpha 0.499996 vs analytic 0.500000
+PASS capsule-capsule-deep         colliding flag matches distance sign
+PASS capsule-capsule-deep         validator ran
+PASS capsule-capsule-deep         validator dist -0.500000 vs primary -0.500008
+PASS sphere-capsule-sep           status CP_OK
+PASS sphere-capsule-sep           distance 1.500000 vs analytic 1.500000
+PASS sphere-capsule-sep           alpha 2.000000 vs analytic 2.000000
+PASS sphere-capsule-sep           colliding flag matches distance sign
+PASS sphere-capsule-sep           validator ran
+PASS sphere-capsule-sep           validator dist 1.500000 vs primary 1.500000
+PASS box-capsule-sep              status CP_OK
+PASS box-capsule-sep              distance 2.499977 vs analytic 2.500000
+PASS box-capsule-sep              alpha 2.666626 vs analytic 2.666667
+PASS box-capsule-sep              colliding flag matches distance sign
+PASS box-capsule-sep              validator ran
+PASS box-capsule-sep              validator dist 2.500000 vs primary 2.499977
+PASS poly-poly-sep                status CP_OK
+PASS poly-poly-sep                distance 1.999992 vs analytic 2.000000
+PASS poly-poly-sep                alpha 1.999992 vs analytic 2.000000
+PASS poly-poly-sep                colliding flag matches distance sign
+PASS poly-poly-sep                validator ran
+PASS poly-poly-sep                validator dist 2.000000 vs primary 1.999992
+PASS poly-poly-deep               status CP_OK
+PASS poly-poly-deep               distance -1.000029 vs analytic -1.000000
+PASS poly-poly-deep               alpha 0.499993 vs analytic 0.500000
+PASS poly-poly-deep               colliding flag matches distance sign
+PASS poly-poly-deep               validator ran
+PASS poly-poly-deep               validator dist -1.000000 vs primary -1.000029
+PASS sphere-poly-sep              status CP_OK
+PASS sphere-poly-sep              distance 1.999985 vs analytic 2.000000
+PASS sphere-poly-sep              alpha 1.999985 vs analytic 2.000000
+PASS sphere-poly-sep              colliding flag matches distance sign
+PASS sphere-poly-sep              validator ran
+PASS sphere-poly-sep              validator dist 2.000000 vs primary 1.999985
+PASS box-poly-sep                 status CP_OK
+PASS box-poly-sep                 distance 1.000000 vs analytic 1.000000
+PASS box-poly-sep                 alpha 1.500000 vs analytic 1.500000
+PASS box-poly-sep                 colliding flag matches distance sign
+PASS box-poly-sep                 validator ran
+PASS box-poly-sep                 validator dist 1.000000 vs primary 1.000000
+PASS capsule-poly-sep             status CP_OK
+PASS capsule-poly-sep             distance 1.499989 vs analytic 1.500000
+PASS capsule-poly-sep             alpha 1.999985 vs analytic 2.000000
+PASS capsule-poly-sep             colliding flag matches distance sign
+PASS capsule-poly-sep             validator ran
+PASS capsule-poly-sep             validator dist 1.500000 vs primary 1.499989
+PASS rot45box-sphere              status CP_OK
+PASS rot45box-sphere              distance 1.585787 vs analytic 1.585786
+PASS rot45box-sphere              alpha 1.656854 vs analytic 1.656854
+PASS rot45box-sphere              colliding flag matches distance sign
+PASS rot45box-sphere              validator ran
+PASS rot45box-sphere              validator dist 1.585786 vs primary 1.585787
+PASS rotcapsule-sphere            status CP_OK
+PASS rotcapsule-sphere            distance 1.500000 vs analytic 1.500000
+PASS rotcapsule-sphere            alpha 2.000000 vs analytic 2.000000
+PASS rotcapsule-sphere            colliding flag matches distance sign
+PASS rotcapsule-sphere            validator ran
+PASS rotcapsule-sphere            validator dist 1.500000 vs primary 1.500000
+PASS tetra-sphere                 status CP_OK
+PASS tetra-sphere                 colliding flag matches distance sign
+PASS tetra-sphere                 validator ran
+PASS tetra-sphere                 validator dist 2.008736 vs primary 2.008752
+PASS coincident-centers           status CP_OK
+PASS coincident-centers           distance 0.000000 vs analytic 0.000000
+PASS coincident-centers           validator ran
+PASS coincident-centers           validator dist 0.000000 vs primary 0.000000
+PASS edge+x-spheres               status CP_OK
+PASS edge+x-spheres               distance 1.000000 vs analytic 1.000000
+PASS edge+x-spheres               alpha 1.500000 vs analytic 1.500000
+PASS edge+x-spheres               colliding flag matches distance sign
+PASS edge+x-spheres               validator ran
+PASS edge+x-spheres               validator dist 1.000000 vs primary 1.000000
+PASS edge-x-spheres               status CP_OK
+PASS edge-x-spheres               distance 1.000000 vs analytic 1.000000
+PASS edge-x-spheres               alpha 1.500000 vs analytic 1.500000
+PASS edge-x-spheres               colliding flag matches distance sign
+PASS edge-x-spheres               validator ran
+PASS edge-x-spheres               validator dist 1.000000 vs primary 1.000000
+PASS edge-corner-spheres          status CP_OK
+PASS edge-corner-spheres          distance 1.000000 vs analytic 1.000000
+PASS edge-corner-spheres          alpha 1.333333 vs analytic 1.333333
+PASS edge-corner-spheres          colliding flag matches distance sign
+PASS edge-corner-spheres          validator ran
+PASS edge-corner-spheres          validator dist 1.000000 vs primary 1.000000
+PASS edge-boxes                   status CP_OK
+PASS edge-boxes                   distance 1.000000 vs analytic 1.000000
+PASS edge-boxes                   alpha 1.500000 vs analytic 1.500000
+PASS edge-boxes                   colliding flag matches distance sign
+PASS edge-boxes                   validator ran
+PASS edge-boxes                   validator dist 1.000000 vs primary 1.000000
+PASS min-extent-spheres           status CP_OK
+PASS min-extent-spheres           distance 0.200000 vs analytic 0.200000
+PASS min-extent-spheres           alpha 3.000000 vs analytic 3.000000
+PASS min-extent-spheres           colliding flag matches distance sign
+PASS min-extent-spheres           validator ran
+PASS min-extent-spheres           validator dist 0.200000 vs primary 0.200000
+PASS max-extent-box-sphere        status CP_OK
+PASS max-extent-box-sphere        distance 4.000116 vs analytic 4.000000
+PASS max-extent-box-sphere        alpha 1.031747 vs analytic 1.031746
+PASS max-extent-box-sphere        colliding flag matches distance sign
+PASS max-extent-box-sphere        validator ran
+PASS max-extent-box-sphere        validator dist 4.000000 vs primary 4.000116
+PASS coord-over+x                 status 1 (want 1)
+PASS coord-over-x                 status 1 (want 1)
+PASS coord-over-y-box             status 1 (want 1)
+PASS size-under-sphere            status 2 (want 2)
+PASS size-over-box                status 2 (want 2)
+PASS size-under-capsule           status 2 (want 2)
+PASS bad-rotation                 status 4 (want 4)
+PASS bad-polytope-nverts          status 4 (want 4)
+PASS bad-pair-index               status
+PASS mixed-batch                  good pair unaffected by bad neighbor
+PASS batch-vs-single              bit-identical results
+PASS determinism                  two runs bit-identical
+
+178 passed, 0 failed
+
+### STEP 7: independent validator agrees within 1mm+0.1% on all pairs
+$ ./build/perf_validate_opt build/shapes.bin build/pairs.bin
+validated 1000 pairs: 756 colliding, max |dist diff| = 0.005259399 m, distance failures = 0, flag mismatches = 0
+
+### STEP 8: median-of-5 speedup on the committed input
+  ref median 0.276135 s | opt median 0.002704 s | speedup 102.12x
+
+### STEP 9: generalization on alternate-seed inputs (>=2; generated via the REFERENCE solver)
+
+-- alternate set 1 (seed 0xA5A5A5A5DEADBEEF) --
+$ ./build/perf_gen_seed build/alt_1.txt 0xA5A5A5A5DEADBEEF 1000
+wrote 1000 pairs to build/alt_1.txt (seed 0xa5a5a5a5deadbeef, 756 colliding, 12 out-of-domain re-rolled, 761 non-overlapping-AABB re-rolled)
+$ make INPUT_TXT=build/alt_1.txt OUT_PREFIX=build/alt_1_ input
+build/build_input build/alt_1.txt build/alt_1_shapes.bin build/alt_1_pairs.bin
+$ make -f Makefile.optimized OUT_PREFIX=build/alt_1_ optinput
+build/build_optimized_shapes build/alt_1_shapes.bin build/alt_1_shapes_optimized.bin
+build/build_optimized_pairs  build/alt_1_pairs.bin  build/alt_1_pairs_optimized.bin
+$ ./build/perf_harness build/alt_1_shapes.bin build/alt_1_pairs.bin build/alt_1_ref.res
+total collision time: 0.275611 s (1000 pairs, single thread)
+$ ./build/perf_harness_opt build/alt_1_shapes_optimized.bin build/alt_1_pairs_optimized.bin build/alt_1_opt.res
+total collision time: 0.002827 s (1000 pairs, single thread)
+$ ./build/compare_results build/alt_1_ref.res build/alt_1_opt.res
+pairs 1000
+ref_collisions 756
+opt_collisions 756
+flag_mismatches 0
+max_distance_diff_mm 575.558000
+max_distance_diff_rel_pct 25.169082
+distance_tol abs 1.0000 mm + rel 0.100 % + cond 5.0e-04*|c1-c2|/alpha^2
+pairs_over_tolerance 0
+max_contact_diff_mm 148.926691
+contacts_matching_reference 686
+PASS
+  seed 1: ref median 0.276097 s | opt median 0.002715 s | speedup 101.69x
+
+-- alternate set 2 (seed 0x0123456789ABCDEF) --
+$ ./build/perf_gen_seed build/alt_2.txt 0x0123456789ABCDEF 1000
+wrote 1000 pairs to build/alt_2.txt (seed 0x123456789abcdef, 756 colliding, 6 out-of-domain re-rolled, 738 non-overlapping-AABB re-rolled)
+$ make INPUT_TXT=build/alt_2.txt OUT_PREFIX=build/alt_2_ input
+build/build_input build/alt_2.txt build/alt_2_shapes.bin build/alt_2_pairs.bin
+$ make -f Makefile.optimized OUT_PREFIX=build/alt_2_ optinput
+build/build_optimized_shapes build/alt_2_shapes.bin build/alt_2_shapes_optimized.bin
+build/build_optimized_pairs  build/alt_2_pairs.bin  build/alt_2_pairs_optimized.bin
+$ ./build/perf_harness build/alt_2_shapes.bin build/alt_2_pairs.bin build/alt_2_ref.res
+total collision time: 0.266156 s (1000 pairs, single thread)
+$ ./build/perf_harness_opt build/alt_2_shapes_optimized.bin build/alt_2_pairs_optimized.bin build/alt_2_opt.res
+total collision time: 0.002688 s (1000 pairs, single thread)
+$ ./build/compare_results build/alt_2_ref.res build/alt_2_opt.res
+pairs 1000
+ref_collisions 756
+opt_collisions 756
+flag_mismatches 0
+max_distance_diff_mm 31.157000
+max_distance_diff_rel_pct 5.561798
+distance_tol abs 1.0000 mm + rel 0.100 % + cond 5.0e-04*|c1-c2|/alpha^2
+pairs_over_tolerance 0
+max_contact_diff_mm 1418.420929
+contacts_matching_reference 701
+PASS
+  seed 2: ref median 0.266592 s | opt median 0.002732 s | speedup 97.58x
+
+-- alternate set 3 (seed 0xFEEDFACECAFEF00D) --
+$ ./build/perf_gen_seed build/alt_3.txt 0xFEEDFACECAFEF00D 1000
+wrote 1000 pairs to build/alt_3.txt (seed 0xfeedfacecafef00d, 775 colliding, 13 out-of-domain re-rolled, 719 non-overlapping-AABB re-rolled)
+$ make INPUT_TXT=build/alt_3.txt OUT_PREFIX=build/alt_3_ input
+build/build_input build/alt_3.txt build/alt_3_shapes.bin build/alt_3_pairs.bin
+$ make -f Makefile.optimized OUT_PREFIX=build/alt_3_ optinput
+build/build_optimized_shapes build/alt_3_shapes.bin build/alt_3_shapes_optimized.bin
+build/build_optimized_pairs  build/alt_3_pairs.bin  build/alt_3_pairs_optimized.bin
+$ ./build/perf_harness build/alt_3_shapes.bin build/alt_3_pairs.bin build/alt_3_ref.res
+total collision time: 0.261361 s (1000 pairs, single thread)
+$ ./build/perf_harness_opt build/alt_3_shapes_optimized.bin build/alt_3_pairs_optimized.bin build/alt_3_opt.res
+total collision time: 0.002695 s (1000 pairs, single thread)
+$ ./build/compare_results build/alt_3_ref.res build/alt_3_opt.res
+pairs 1000
+ref_collisions 775
+opt_collisions 775
+flag_mismatches 0
+max_distance_diff_mm 5.439000
+max_distance_diff_rel_pct 5.872170
+distance_tol abs 1.0000 mm + rel 0.100 % + cond 5.0e-04*|c1-c2|/alpha^2
+pairs_over_tolerance 0
+max_contact_diff_mm 33.464526
+contacts_matching_reference 686
+PASS
+  seed 3: ref median 0.260897 s | opt median 0.002667 s | speedup 97.82x
+
+### STEP 10: determinism — two optimized runs are byte-identical
+$ ./build/perf_harness_opt build/shapes_optimized.bin build/pairs_optimized.bin build/det_a.res
+total collision time: 0.002844 s (1000 pairs, single thread)
+$ ./build/perf_harness_opt build/shapes_optimized.bin build/pairs_optimized.bin build/det_b.res
+total collision time: 0.002879 s (1000 pairs, single thread)
+$ diff -q build/det_a.res build/det_b.res
+
+committed input sha256 (after):  9bd4939dc3d6c7d66459fe064768bf2d904b59410c4d8929107c9264c96dd555
+
+================================================================
+ FINAL SUMMARY — measured (committed input)
+================================================================
+  comparator:            PASS (flag mismatches 0, max dev 5.259000 mm, over-tol 0; dist tol 1mm+0.1%+cond)
+  contact certifier:     PASS (1000/1000 valid, max surface 0.737154 mm, max separation 4.128762 mm)
+  full test suite:       178 passed, 0 failed
+  independent validator: validated 1000 pairs: 756 colliding, max |dist diff| = 0.005259399 m, distance failures = 0, flag mismatches = 0
+  determinism:           byte-identical
+  precompute time:       0.021 s (build stage; excluded from runtime; limit 3600 s)
+  reference median:      0.276135 s
+  optimized median:      0.002704 s  (solve only; per-shape build precomputed)
+  speedup (committed):   102.12x
+  committed input sha256: 9bd4939dc3d6c7d66459fe064768bf2d904b59410c4d8929107c9264c96dd555 (unchanged)
+================================================================
+PROOF COMPLETE
