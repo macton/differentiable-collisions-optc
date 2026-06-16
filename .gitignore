@@ -1,3 +1,6 @@
+# Local nagent working directory
+.nagent/
+
 # Prerequisites
 *.d
 
@@ -53,3 +56,4 @@ dkms.conf
 
 # debug information files
 *.dwo
+

@@ -4,7 +4,7 @@
 
 This repository implements the collision query from K. Tracy, T. A. Howell, and
 Z. Manchester, *"Differentiable Collision Detection for a Set of Convex
-Primitives"* (arXiv:2207.00669, `documents/2207.00669.pdf`). For a pair of
+Primitives"* (arXiv:2207.00669, [`documents/2207.00669.pdf`](documents/2207.00669.pdf)). For a pair of
 convex primitives — sphere, box, capsule, or convex polytope — it computes the
 minimum uniform scaling **α** that must be applied to both shapes for them to
 touch (the paper's problem (10)), and the contact points from eq. (24). `α < 1`
@@ -19,8 +19,8 @@ trivial rejection of far-apart shapes.
 
 There are two implementations here:
 
-- **`src/`** — a reference C implementation that follows the paper directly.
-- **`src-optimized/`** — an optimized single-precision implementation that
+- **[`src/`](src/)** — a reference C implementation that follows the paper directly.
+- **[`src-optimized/`](src-optimized/)** — an optimized single-precision implementation that
   produces the same collision flags and the same distances (within a stated
   tolerance) and runs the committed 1000-pair benchmark **about 102× faster**
   than the reference: reference median ≈ 0.276 s, optimized median ≈ 0.0027 s
@@ -37,7 +37,7 @@ benchmark, ~98–102× generally," and no more. Numbers and caveats are in
 
 Two reasons, equally important:
 
-1. **To provide the optimized collision routines.** `src-optimized/` is real,
+1. **To provide the optimized collision routines.** [`src-optimized/`](src-optimized/) is real,
    tested code you can build and use, held to the reference by an independent
    harness.
 2. **To show how an LLM was used to do the optimization** — concretely and
@@ -67,7 +67,7 @@ derived bound or a proof of a ceiling — it is an engineer's estimate, and I
 state it as one. It turned out to be roughly the right order of magnitude to
 push hard against.
 
-My approach is itself written down, in `context/data-oriented-design.md`. Those
+My approach is itself written down, in [`context/data-oriented-design.md`](https://github.com/macton/nagent/blob/main/context/data-oriented-design.md). Those
 operating rules — start from the real data, state the cost, remove work before
 doing it faster, handle the common case straight-line — were injected into every
 optimization conversation. So "what I contributed" is not just the target and
@@ -87,24 +87,24 @@ That is the difference between a demo and a result.
 ## Method — four documents, four phases
 
 Each phase is an instruction document and the artifact it produced. The
-documents live in `prompts/`.
+documents live in [`prompts/`](prompts/).
 
-1. **`prompts/create-reference.md` → the reference (`src/`).** A faithful C11
+1. **[`prompts/create-reference.md`](prompts/create-reference.md) → the reference ([`src/`](src/)).** A faithful C11
    port of the paper: the α solve and the contact points from eq. (24), with
    explicit input validation. This is the correctness anchor everything else is
    measured against.
 
-2. **`prompts/create-optimized-test-harness.md` → the harness.** This specifies
+2. **[`prompts/create-optimized-test-harness.md`](prompts/create-optimized-test-harness.md) → the harness.** This specifies
    the test, comparison, and measurement scaffold and its constraints: a fixed,
    committed 1000-pair input; a reference-vs-optimized comparator; an
    independent validator that shares no code with either solver; a contact-point
    certifier; a determinism check; and a median-of-5 timing protocol. Crucially,
    the harness was built and proven against an *identity copy* of the reference
    **before** any optimization existed (see
-   `performance-test-optimized/HARNESS-BASELINE.md`), so the measurement pipeline
+   [`performance-test-optimized/HARNESS-BASELINE.md`](performance-test-optimized/HARNESS-BASELINE.md)), so the measurement pipeline
    itself was trusted before it was used to judge anything.
 
-3. **`prompts/create-optimized.md` → the optimized solver (`src-optimized/`).**
+3. **[`prompts/create-optimized.md`](prompts/create-optimized.md) → the optimized solver ([`src-optimized/`](src-optimized/)).**
    This is my optimization approach turned into instructions the model iterates
    on: profile where the cycles go, rank candidates by payoff, prefer removing
    work, run a simplification pass, keep the common case branch-minimal, and
@@ -123,14 +123,13 @@ documents live in `prompts/`.
    so every turn began with the real, measured gate status injected into the
    conversation — not the model's memory of it.
 
-4. **`prompts/create-visualizer.md` → the visualizer (`viz/`).** Described
+4. **[`prompts/create-visualizer.md`](prompts/create-visualizer.md) → the visualizer ([`viz/`](viz/)).** Described
    below.
 
 ## What was optimized — and what was rejected
 
 The full per-hypothesis history, with measurements and keep/revert decisions, is
-in `src-optimized/OPTIMIZATION-LOG.md`. The git history mirrors it: one commit
-per kept change, plus a commit recording each rejected trial. The shape of the
+in [`src-optimized/OPTIMIZATION-LOG.md`](src-optimized/OPTIMIZATION-LOG.md). The shape of the
 progress matters more than any single step — it was incremental, measured, and
 reversible, and the dead ends were written down rather than hidden.
 
@@ -172,21 +171,21 @@ supposed to be. It is accepted only when:
 - the **collision flags are identical** — it flags exactly the same pairs as
   colliding as the reference; and
 - **every distance** agrees within
-  `|Δ| ≤ 1 mm + 0.1%·|d_ref| + 5e-4·(|c1−c2|/α²)` (`build/compare_results`).
+  `|Δ| ≤ 1 mm + 0.1%·|d_ref| + 5e-4·(|c1−c2|/α²)` ([`build/compare_results`](build/compare_results)).
   The 1 mm floor is the documented resolution; the relative term covers large
   separations; the last is a conditioning term — a fixed α error scales by
   `|c1−c2|/α²`, so it grows only at extreme penetration, where single precision
   genuinely cannot resolve the depth and the value is least actionable.
 
 Contact points are **certified for validity, not matched**: a face or edge
-contact has many equally valid witness points, so `build/validate_contacts`
+contact has many equally valid witness points, so [`build/validate_contacts`](build/validate_contacts)
 independently checks that each emitted point lies on both surfaces and is
 separated by the reported distance, rather than requiring it to equal the
 reference's choice.
 
 ## The visualizer
 
-`viz/` is a small, self-contained web tool (`prompts/create-visualizer.md`) that
+[`viz/`](viz/) is a small, self-contained web tool ([`prompts/create-visualizer.md`](prompts/create-visualizer.md)) that
 renders one query pair at a time: the two primitives, the contact points emitted
 by both the reference and the optimized solver, and the separation between them.
 It is how I eyeball that a result is geometrically sane, not just within a
@@ -270,4 +269,4 @@ benchmark cannot be quietly edited to flatter a result.
 ## Citation
 
 > K. Tracy, T. A. Howell, Z. Manchester. *Differentiable Collision Detection for
-> a Set of Convex Primitives.* arXiv:2207.00669. (`documents/2207.00669.pdf`)
+> a Set of Convex Primitives.* arXiv:2207.00669. ([`documents/2207.00669.pdf`](documents/2207.00669.pdf))

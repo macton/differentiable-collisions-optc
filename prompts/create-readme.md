@@ -41,7 +41,9 @@ the README must come from the repository, not from your assumptions.
   - `prove-optimized-harness.sh` and `performance-test-optimized/HARNESS-BASELINE.md`
     — the proof harness and its baseline.
   - `context/data-oriented-design.md` — the operating rules injected into every
-    optimization conversation. (Part of "what the human contributed.")
+    optimization conversation. (Part of "what the human contributed.") In the
+    README, link this to the file in the nagent repo:
+    https://github.com/macton/nagent/blob/main/context/data-oriented-design.md .
   - `viz/` and `viz/shots/*.png` — the visualizer and its screenshots.
 - **The headline speedup is a measured value, not a guess.** Obtain it by
   running `./prove-optimized-harness.sh` (its FINAL SUMMARY prints the
@@ -86,7 +88,7 @@ section are not negotiable.
      code and made a judgment call about what I believed was achievable on this
      hardware; it was not derived from a formal bound. Wrote the four
      instruction documents. Encoded my engineering approach as operating rules
-     (`context/data-oriented-design.md`) injected into every conversation. Made
+     ([`context/data-oriented-design.md`](https://github.com/macton/nagent/blob/main/context/data-oriented-design.md)) injected into every conversation. Made
      course corrections and decided what to keep.
    - **GPT-5.5 (the model).** Generated the reference implementation, the test
      harness, and the optimized solver from the instruction documents; proposed
@@ -123,22 +125,23 @@ section are not negotiable.
 
 4. **Methodology — four documents, four phases.** Walk through how the repo was
    built, one phase per instruction document. For each, link the file and say in
-   2–4 sentences what it specifies and what it produced:
-   1. `prompts/create-reference.md` → the reference implementation in `src/`
+   2–4 sentences what it specifies and what it produced. Use Markdown links for
+   file references in this section and elsewhere in the README:
+   1. [`prompts/create-reference.md`](prompts/create-reference.md) → the reference implementation in [`src/`](src/)
       (a faithful port of the paper's problem (10) solve and contacts from
       eq. (24)).
-   2. `prompts/create-optimized-test-harness.md` → the test, comparison, and
+   2. [`prompts/create-optimized-test-harness.md`](prompts/create-optimized-test-harness.md) → the test, comparison, and
       measurement harness: its requirements and constraints, the grounding
       scripts that keep every version honest, the committed fixed input, the
       independent validator. Emphasize that the harness was built and proven
       against an identity copy **before** any optimization, so the measurement
       pipeline itself is trusted.
-   3. `prompts/create-optimized.md` → the optimization instructions: how I
+   3. [`prompts/create-optimized.md`](prompts/create-optimized.md) → the optimization instructions: how I
       approach optimizing (data first, state the cost, remove work, the
       simplification pass, batch/branch-free/layout as first-class levers),
       turned into instructions the model iterates on. This is where nagent and
       `prove-optimized-harness.sh` come in (cross-reference the roles section).
-   4. `prompts/create-visualizer.md` → the visualizer (see its own section).
+   4. [`prompts/create-visualizer.md`](prompts/create-visualizer.md) → the visualizer (see its own section).
 
 5. **What was optimized — and what was rejected.** Mine `OPTIMIZATION-LOG.md`.
    Do **not** paste the log. Summarize it for a reader: a readable list or table
@@ -149,7 +152,9 @@ section are not negotiable.
    count reductions), and a shorter list of notable **rejected** trials (what
    was tried and why it was dropped — regressed, or broke the tolerance/flag
    contract). The point a reader should take away: progress was incremental,
-   measured, and reversible; dead ends were recorded, not hidden. If the log
+   measured, and reversible; dead ends were recorded, not hidden. Do not claim
+   that the git history has one commit per kept change or one commit per rejected
+   trial; that is not accurate. If the log
    records per-hypothesis cost (tokens, wall-clock), mention that the cost of
    each step was tracked.
 
