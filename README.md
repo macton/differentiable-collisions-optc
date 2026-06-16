@@ -1,6 +1,6 @@
 # Convex Primitive Collision Detection — reference and LLM-optimized
 
-![A sample query pair from the benchmark: two convex primitives with the reported contact points and the separation between them](viz/shots/pair-0000.png)
+![A sample query pair from the benchmark: two convex primitives with the reported contact points and the separation between them](viz/shots/pair-0001.png)
 
 This repository implements the collision query from K. Tracy, T. A. Howell, and
 Z. Manchester, *"Differentiable Collision Detection for a Set of Convex
@@ -200,7 +200,6 @@ python3 -m http.server 8000      # ES modules need an origin
 # open http://localhost:8000/index.html
 ```
 
-![Sample benchmark pair](viz/shots/pair-0001.png)
 ![Sample benchmark pair](viz/shots/pair-0006.png)
 ![Sample benchmark pair](viz/shots/pair-0805.png)
 
