@@ -14,10 +14,13 @@
  *   capsule:      |x - (r + gamma*bx)| <= alpha*R,
  *                 -alpha*L/2 <= gamma <= alpha*L/2   (eqs. 12-13, SOC+lin)
  *   sphere:       |x - r| <= alpha*R                 (eq. 21, SOC)
- * One identical conic path for every pair type: assemble that pair's
- * constraint rows and solve with a log-barrier interior-point Newton
- * method in float precision (n <= 6 unknowns: x, alpha, up to two
- * capsule gammas). Contact points use eq. (24): p = c + (x* - c)/alpha*.
+ * This optimized variant finds the minimal scaling alpha* per pair without an
+ * interior-point solve: a closed-form alpha for the sphere/box/capsule
+ * sub-cases and a separating-axis form for box-polytope, otherwise GJK
+ * distance on the alpha-scaled shapes with bisection on alpha (the support
+ * function samples S(alpha) directly). All geometry runs register-resident in
+ * single-precision SIMD (v128f). Contact points use eq. (24):
+ * p = c + (x* - c)/alpha*.
  *
  * colliding := alpha* < 1.
  * distance  := |c1 - c2| * (1 - 1/alpha*)  ==  signed |p1 - p2|
@@ -132,36 +135,16 @@ typedef struct {
   v128f   c;
 } cp_shape_lite;
 
-static float d3dot(const float a[3], const float b[3]) {
-  return vdot3(vld3(a), vld3(b));
-}
-
 /* rotation must be orthonormal (3e-3 tol) with det ~ +1 */
 static int rot_ok(const float rotf[9]) {
-  float q[3][3];
-  int i, j;
-  for (i = 0; i < 3; ++i)
-    for (j = 0; j < 3; ++j)
-      q[i][j] = rotf[3 * i + j];
-  for (i = 0; i < 3; ++i) {
-    float n = q[i][0] * q[i][0] + q[i][1] * q[i][1] + q[i][2] * q[i][2];
-    if (fabsf(n - 1.0f) > 3e-3)
-      return 0;
-  }
-  for (i = 0; i < 3; ++i) {
-    for (j = i + 1; j < 3; ++j) {
-      float d = q[i][0] * q[j][0] + q[i][1] * q[j][1] + q[i][2] * q[j][2];
-      if (fabsf(d) > 3e-3)
-        return 0;
-    }
-  }
-  {
-    float det = q[0][0] * (q[1][1] * q[2][2] - q[1][2] * q[2][1])
-               - q[0][1] * (q[1][0] * q[2][2] - q[1][2] * q[2][0])
-               + q[0][2] * (q[1][0] * q[2][1] - q[1][1] * q[2][0]);
-    if (det < 0.5)
-      return 0;
-  }
+  v128f q0 = vld3(&rotf[0]), q1 = vld3(&rotf[3]), q2 = vld3(&rotf[6]);
+  if (fabsf(vdot3(q0, q0) - 1.0f) > 3e-3) return 0;
+  if (fabsf(vdot3(q1, q1) - 1.0f) > 3e-3) return 0;
+  if (fabsf(vdot3(q2, q2) - 1.0f) > 3e-3) return 0;
+  if (fabsf(vdot3(q0, q1)) > 3e-3) return 0;
+  if (fabsf(vdot3(q0, q2)) > 3e-3) return 0;
+  if (fabsf(vdot3(q1, q2)) > 3e-3) return 0;
+  if (vdot3(q0, Vec3Cross(q1, q2)) < 0.5f) return 0; /* det = r0.(r1 x r2) */
   return 1;
 }
 
@@ -288,8 +271,8 @@ static int CP_UNUSED_FUNC poly_edges(int n, const v128f *w,
  * Check order (explicit): rotation/params (BAD_PRIM), then coordinate
  * range (COORD_RANGE), then extent range (SIZE_RANGE). */
 static void CP_UNUSED_FUNC build_shape(const cp_prim *p, cp_shape *s) {
-  float r[3], Q[3][3], mn[3], mx[3], c3[3];
-  int i, j;
+  v128f r, mn, mx, c, col0, col1, col2;
+  v128f ext;
   memset(s, 0, sizeof *s);
   s->type = p->type;
   s->status = CP_OK;
@@ -297,11 +280,11 @@ static void CP_UNUSED_FUNC build_shape(const cp_prim *p, cp_shape *s) {
     s->status = CP_ERR_BAD_PRIM;
     return;
   }
-  for (i = 0; i < 3; ++i) {
-    r[i] = p->pos[i];
-    for (j = 0; j < 3; ++j)
-      Q[i][j] = p->rot[3 * i + j];
-  }
+  r = vld3(p->pos);
+  /* world body axes = columns of WQB (row-major rot[3i+j]) */
+  col0 = VecSetR(p->rot[0], p->rot[3], p->rot[6], 0.0f);
+  col1 = VecSetR(p->rot[1], p->rot[4], p->rot[7], 0.0f);
+  col2 = VecSetR(p->rot[2], p->rot[5], p->rot[8], 0.0f);
   switch (p->type) {
   case CP_SPHERE: {
     if (!(p->radius > 0.0f)) {
@@ -309,54 +292,41 @@ static void CP_UNUSED_FUNC build_shape(const cp_prim *p, cp_shape *s) {
       return;
     }
     s->R = p->radius;
-    for (i = 0; i < 3; ++i) {
-      c3[i] = r[i];
-      mn[i] = r[i] - s->R;
-      mx[i] = r[i] + s->R;
-    }
+    c = r;
+    mn = VecSubf(r, s->R);
+    mx = VecAddf(r, s->R);
   } break;
   case CP_BOX: {
-    float h[3];
-    for (i = 0; i < 3; ++i) {
-      h[i] = p->half_extent[i];
-      if (!(p->half_extent[i] > 0.0f)) {
-        s->status = CP_ERR_BAD_PRIM;
-        return;
-      }
+    v128f h = vld3(p->half_extent), e;
+    if ((VecMovemask(VecCmpGt(h, VecZero())) & 0x7) != 0x7) { /* all xyz > 0 */
+      s->status = CP_ERR_BAD_PRIM;
+      return;
     }
     s->nface = 6;
-    for (j = 0; j < 3; ++j) { /* +/- world columns of Q (eq. 11 form) */
-      v128f col = VecSetR(Q[0][j], Q[1][j], Q[2][j], 0.0f);
-      s->fa[2 * j] = col;
-      s->fa[2 * j + 1] = VecNeg(col);
-      s->fb[2 * j] = h[j];
-      s->fb[2 * j + 1] = h[j];
-    }
-    for (i = 0; i < 3; ++i) {
-      float e = fabsf(Q[i][0]) * h[0] + fabsf(Q[i][1]) * h[1]
-               + fabsf(Q[i][2]) * h[2];
-      c3[i] = r[i];
-      mn[i] = r[i] - e;
-      mx[i] = r[i] + e;
-    }
+    s->fa[0] = col0; s->fa[1] = VecNeg(col0); s->fb[0] = s->fb[1] = VecGetX(h);
+    s->fa[2] = col1; s->fa[3] = VecNeg(col1); s->fb[2] = s->fb[3] = VecGetY(h);
+    s->fa[4] = col2; s->fa[5] = VecNeg(col2); s->fb[4] = s->fb[5] = VecGetZ(h);
+    /* AABB half-extent e[i] = sum_j |col_j[i]| * h[j] */
+    e = VecAdd(VecAdd(VecMulf(VecFabs(col0), VecGetX(h)),
+                      VecMulf(VecFabs(col1), VecGetY(h))),
+               VecMulf(VecFabs(col2), VecGetZ(h)));
+    c = r;
+    mn = VecSub(r, e);
+    mx = VecAdd(r, e);
   } break;
   case CP_CAPSULE: {
-    float axis3[3];
+    v128f e;
     if (!(p->radius > 0.0f) || !(p->length > 0.0f)) {
       s->status = CP_ERR_BAD_PRIM;
       return;
     }
     s->R = p->radius;
-    s->hl = 0.5 * (float)p->length;
-    for (i = 0; i < 3; ++i)
-      axis3[i] = Q[i][0]; /* bx = WQB * [1,0,0]^T */
-    s->axis = VecSetR(axis3[0], axis3[1], axis3[2], 0.0f);
-    for (i = 0; i < 3; ++i) {
-      float e = s->hl * fabsf(axis3[i]) + s->R;
-      c3[i] = r[i];
-      mn[i] = r[i] - e;
-      mx[i] = r[i] + e;
-    }
+    s->hl = 0.5f * (float)p->length;
+    s->axis = col0; /* bx = WQB * [1,0,0]^T = column 0 */
+    e = VecAddf(VecMulf(VecFabs(col0), s->hl), s->R);
+    c = r;
+    mn = VecSub(r, e);
+    mx = VecAdd(r, e);
   } break;
   case CP_POLYTOPE: {
     /* Fit the hull halfspaces in the CENTROID-LOCAL frame, not world space.
@@ -369,47 +339,35 @@ static void CP_UNUSED_FUNC build_shape(const cp_prim *p, cp_shape *s) {
      * precise. fb = fa.(vert - centroid) matches the runtime snap, which
      * evaluates fa.(p - s->c) against the world centroid s->c. This is build-
      * stage work, excluded from the timed solve. */
-    float w[CP_MAX_POLY_VERTS][3];   /* verts relative to the local centroid */
-    v128f wv[CP_MAX_POLY_VERTS];     /* same, as v128f for the hull scans    */
-    float lc[3];                     /* local centroid                       */
+    v128f wv[CP_MAX_POLY_VERTS];     /* verts relative to the local centroid */
+    v128f lc = VecZero();            /* local centroid                       */
     float scale;
-    int n = (int)p->vert_count;
+    int n = (int)p->vert_count, j;
     if (n < 4 || n > CP_MAX_POLY_VERTS) {
       s->status = CP_ERR_BAD_PRIM;
       return;
     }
-    for (i = 0; i < 3; ++i) {
-      mn[i] = 1e30f;
-      mx[i] = -1e30f;
-      c3[i] = 0.0f;
-      lc[i] = 0.0f;
-    }
+    mn = VecSet1(1e30f);
+    mx = VecSet1(-1e30f);
+    c = VecZero();
     for (j = 0; j < n; ++j) {
-      for (i = 0; i < 3; ++i) {
-        float wl = Q[i][0] * p->verts[j][0]
-                 + Q[i][1] * p->verts[j][1]
-                 + Q[i][2] * p->verts[j][2];     /* body-rotated, meter scale */
-        float ww = r[i] + wl;                     /* world vert (km scale)     */
-        w[j][i] = wl;
-        lc[i] += wl;
-        c3[i] += ww;
-        if (ww < mn[i]) mn[i] = ww;
-        if (ww > mx[i]) mx[i] = ww;
-      }
+      v128f vb = vld3(p->verts[j]);
+      /* body-rotated, meter scale: wl = col0*vb.x + col1*vb.y + col2*vb.z */
+      v128f wl = VecAdd(VecAdd(VecMul(col0, VecSplatX(vb)),
+                               VecMul(col1, VecSplatY(vb))),
+                        VecMul(col2, VecSplatZ(vb)));
+      v128f ww = VecAdd(r, wl);                   /* world vert (km scale) */
+      wv[j] = wl;
+      lc = VecAdd(lc, wl);
+      c = VecAdd(c, ww);
+      mn = VecMin(mn, ww);
+      mx = VecMax(mx, ww);
     }
-    for (i = 0; i < 3; ++i) {
-      lc[i] /= (float)n;
-      c3[i] /= (float)n;
-    }
-    for (j = 0; j < n; ++j) {
-      for (i = 0; i < 3; ++i)
-        w[j][i] -= lc[i];                         /* center on local centroid  */
-      wv[j] = vld3(w[j]);                          /* load once for the scans   */
-    }
-    scale = 0.0f;
-    for (i = 0; i < 3; ++i)
-      if (mx[i] - mn[i] > scale)
-        scale = mx[i] - mn[i];
+    lc = VecDivf(lc, (float)n);
+    c = VecDivf(c, (float)n);
+    for (j = 0; j < n; ++j)
+      wv[j] = VecSub(wv[j], lc);                  /* center on local centroid */
+    scale = Max3(VecSub(mx, mn));
     if (!poly_faces(n, wv, VecZero(), scale, s)) { /* fit origin = 0 */
       s->status = CP_ERR_BAD_PRIM;
       return;
@@ -423,25 +381,21 @@ static void CP_UNUSED_FUNC build_shape(const cp_prim *p, cp_shape *s) {
     s->status = CP_ERR_BAD_PRIM;
     return;
   }
-  s->c = vld3(c3);
-  for (i = 0; i < 3; ++i) {
-    if (mn[i] < -CP_DOMAIN_MAX || mx[i] > CP_DOMAIN_MAX) {
-      s->status = CP_ERR_COORD_RANGE;
-      return;
-    }
+  s->c = c;
+  if ((VecMovemask(VecCmpLt(mn, VecSet1(-(float)CP_DOMAIN_MAX))) & 0x7) ||
+      (VecMovemask(VecCmpGt(mx, VecSet1((float)CP_DOMAIN_MAX))) & 0x7)) {
+    s->status = CP_ERR_COORD_RANGE;
+    return;
   }
-  for (i = 0; i < 3; ++i) {
-    float ext = mx[i] - mn[i];
-    if (ext < CP_EXTENT_MIN || ext > CP_EXTENT_MAX) {
-      s->status = CP_ERR_SIZE_RANGE;
-      return;
-    }
+  ext = VecSub(mx, mn);
+  if (Min3(ext) < CP_EXTENT_MIN || Max3(ext) > CP_EXTENT_MAX) {
+    s->status = CP_ERR_SIZE_RANGE;
+    return;
   }
 }
 
 static void build_shape_lite(const cp_prim *p, cp_shape_lite *s) {
-  float r[3], Q[3][3], mn[3], mx[3], c3[3];
-  int i, j;
+  v128f r, mn, mx, c, col0, col1, col2, ext;
   memset(s, 0, sizeof *s);
   s->type = p->type;
   s->status = CP_OK;
@@ -449,11 +403,10 @@ static void build_shape_lite(const cp_prim *p, cp_shape_lite *s) {
     s->status = CP_ERR_BAD_PRIM;
     return;
   }
-  for (i = 0; i < 3; ++i) {
-    r[i] = p->pos[i];
-    for (j = 0; j < 3; ++j)
-      Q[i][j] = p->rot[3 * i + j];
-  }
+  r = vld3(p->pos);
+  col0 = VecSetR(p->rot[0], p->rot[3], p->rot[6], 0.0f);
+  col1 = VecSetR(p->rot[1], p->rot[4], p->rot[7], 0.0f);
+  col2 = VecSetR(p->rot[2], p->rot[5], p->rot[8], 0.0f);
   switch (p->type) {
   case CP_SPHERE: {
     float radius;
@@ -462,408 +415,71 @@ static void build_shape_lite(const cp_prim *p, cp_shape_lite *s) {
       return;
     }
     radius = p->radius;
-    for (i = 0; i < 3; ++i) {
-      c3[i] = r[i];
-      mn[i] = r[i] - radius;
-      mx[i] = r[i] + radius;
-    }
+    c = r;
+    mn = VecSubf(r, radius);
+    mx = VecAddf(r, radius);
   } break;
   case CP_BOX: {
-    float h[3];
-    for (i = 0; i < 3; ++i) {
-      h[i] = p->half_extent[i];
-      if (!(p->half_extent[i] > 0.0f)) {
-        s->status = CP_ERR_BAD_PRIM;
-        return;
-      }
+    v128f h = vld3(p->half_extent), e;
+    if ((VecMovemask(VecCmpGt(h, VecZero())) & 0x7) != 0x7) {
+      s->status = CP_ERR_BAD_PRIM;
+      return;
     }
-    for (i = 0; i < 3; ++i) {
-      float e = fabsf(Q[i][0]) * h[0] + fabsf(Q[i][1]) * h[1]
-               + fabsf(Q[i][2]) * h[2];
-      c3[i] = r[i];
-      mn[i] = r[i] - e;
-      mx[i] = r[i] + e;
-    }
+    e = VecAdd(VecAdd(VecMulf(VecFabs(col0), VecGetX(h)),
+                      VecMulf(VecFabs(col1), VecGetY(h))),
+               VecMulf(VecFabs(col2), VecGetZ(h)));
+    c = r;
+    mn = VecSub(r, e);
+    mx = VecAdd(r, e);
   } break;
   case CP_CAPSULE: {
-    float radius;
-    float hl;
+    v128f e;
+    float radius, hl;
     if (!(p->radius > 0.0f) || !(p->length > 0.0f)) {
       s->status = CP_ERR_BAD_PRIM;
       return;
     }
     radius = p->radius;
-    hl = 0.5 * (float)p->length;
-    for (i = 0; i < 3; ++i) {
-      float e = hl * fabsf(Q[i][0]) + radius;
-      c3[i] = r[i];
-      mn[i] = r[i] - e;
-      mx[i] = r[i] + e;
-    }
+    hl = 0.5f * (float)p->length;
+    e = VecAddf(VecMulf(VecFabs(col0), hl), radius);
+    c = r;
+    mn = VecSub(r, e);
+    mx = VecAdd(r, e);
   } break;
   case CP_POLYTOPE: {
-    int n = (int)p->vert_count;
+    int n = (int)p->vert_count, j;
     if (n < 4 || n > CP_MAX_POLY_VERTS) {
       s->status = CP_ERR_BAD_PRIM;
       return;
     }
-    for (i = 0; i < 3; ++i) {
-      mn[i] = 1e30f;
-      mx[i] = -1e30f;
-      c3[i] = 0.0;
-    }
+    mn = VecSet1(1e30f);
+    mx = VecSet1(-1e30f);
+    c = VecZero();
     for (j = 0; j < n; ++j) {
-      for (i = 0; i < 3; ++i) {
-        float w = r[i] + Q[i][0] * p->verts[j][0]
-                        + Q[i][1] * p->verts[j][1]
-                        + Q[i][2] * p->verts[j][2];
-        if (w < mn[i]) mn[i] = w;
-        if (w > mx[i]) mx[i] = w;
-        c3[i] += w;
-      }
+      v128f vb = vld3(p->verts[j]);
+      v128f w = VecAdd(r, VecAdd(VecAdd(VecMul(col0, VecSplatX(vb)),
+                                        VecMul(col1, VecSplatY(vb))),
+                                 VecMul(col2, VecSplatZ(vb))));
+      mn = VecMin(mn, w);
+      mx = VecMax(mx, w);
+      c = VecAdd(c, w);
     }
-    for (i = 0; i < 3; ++i)
-      c3[i] /= (float)n;
+    c = VecDivf(c, (float)n);
   } break;
   default:
     s->status = CP_ERR_BAD_PRIM;
     return;
   }
-  s->c = vld3(c3);
-  for (i = 0; i < 3; ++i) {
-    if (mn[i] < -CP_DOMAIN_MAX || mx[i] > CP_DOMAIN_MAX) {
-      s->status = CP_ERR_COORD_RANGE;
-      return;
-    }
-  }
-  for (i = 0; i < 3; ++i) {
-    float ext = mx[i] - mn[i];
-    if (ext < CP_EXTENT_MIN || ext > CP_EXTENT_MAX) {
-      s->status = CP_ERR_SIZE_RANGE;
-      return;
-    }
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/* one pair's conic program over u = (x[3], alpha, gamma_a?, gamma_b?) */
-typedef struct {
-  int    nvar, nlin, nsoc;
-  float lw[CP_MAX_ROWS][CP_NVAR_MAX]; /* linear rows: lw.u + ld <= 0  */
-  float ld[CP_MAX_ROWS];
-  float sA[2][3][CP_NVAR_MAX];        /* SOC: |sA.u + sb| <= alpha*sR */
-  float sb[2][3];
-  float sR[2];
-} cp_prob;
-
-static void add_lin(cp_prob *pr, const float w[CP_NVAR_MAX], float d) {
-  memcpy(pr->lw[pr->nlin], w, sizeof(float) * CP_NVAR_MAX);
-  pr->ld[pr->nlin] = d;
-  ++pr->nlin;
-}
-
-/* cl = shape scaling center in the pair-local frame */
-static void add_shape_constraints(cp_prob *pr, const cp_shape *s,
-                                  const float cl[3]) {
-  int i;
-  if (s->type == CP_SPHERE || s->type == CP_CAPSULE) {
-    int k = pr->nsoc++;
-    memset(pr->sA[k], 0, sizeof pr->sA[k]);
-    pr->sA[k][0][0] = 1.0;
-    pr->sA[k][1][1] = 1.0;
-    pr->sA[k][2][2] = 1.0;
-    for (i = 0; i < 3; ++i)
-      pr->sb[k][i] = -cl[i];
-    pr->sR[k] = s->R;
-    if (s->type == CP_CAPSULE) {
-      int g = pr->nvar++;
-      float w[CP_NVAR_MAX], axis3[3];
-      Vec3Store(axis3, s->axis);
-      for (i = 0; i < 3; ++i)
-        pr->sA[k][i][g] = -axis3[i];
-      memset(w, 0, sizeof w);
-      w[3] = -s->hl;
-      w[g] = 1.0; /*  gamma - alpha*L/2 <= 0  (eq. 13) */
-      add_lin(pr, w, 0.0);
-      w[g] = -1.0; /* -gamma - alpha*L/2 <= 0  (eq. 13) */
-      add_lin(pr, w, 0.0);
-    }
-  } else { /* box / polytope halfspaces (eq. 11) */
-    for (i = 0; i < s->nface; ++i) {
-      float w[CP_NVAR_MAX], fa3[3];
-      memset(w, 0, sizeof w);
-      Vec3Store(fa3, s->fa[i]);
-      w[0] = fa3[0];
-      w[1] = fa3[1];
-      w[2] = fa3[2];
-      w[3] = -s->fb[i];
-      add_lin(pr, w, -vdot3(s->fa[i], vld3(cl)));
-    }
-  }
-}
-
-static int p_feas(const cp_prob *pr, const float u[]) {
-  int i, j, k;
-  for (i = 0; i < pr->nlin; ++i) {
-    float f = pr->ld[i];
-    for (j = 0; j < pr->nvar; ++j)
-      f += pr->lw[i][j] * u[j];
-    if (f >= 0.0)
-      return 0;
-  }
-  for (k = 0; k < pr->nsoc; ++k) {
-    float tr = u[3] * pr->sR[k];
-    float v[3], s2;
-    if (tr <= 0.0)
-      return 0;
-    for (i = 0; i < 3; ++i) {
-      v[i] = pr->sb[k][i];
-      for (j = 0; j < pr->nvar; ++j)
-        v[i] += pr->sA[k][i][j] * u[j];
-    }
-    s2 = tr * tr - d3dot(v, v);
-    if (s2 <= 0.0)
-      return 0;
-  }
-  return 1;
-}
-
-/* barrier objective; only called on strictly feasible u */
-static float p_phi(const cp_prob *pr, float tpar, const float u[]) {
-  int i, j, k;
-  float phi = tpar * u[3];
-  for (i = 0; i < pr->nlin; ++i) {
-    float f = pr->ld[i];
-    for (j = 0; j < pr->nvar; ++j)
-      f += pr->lw[i][j] * u[j];
-    phi -= logf(-f);
-  }
-  for (k = 0; k < pr->nsoc; ++k) {
-    float tr = u[3] * pr->sR[k];
-    float v[3];
-    for (i = 0; i < 3; ++i) {
-      v[i] = pr->sb[k][i];
-      for (j = 0; j < pr->nvar; ++j)
-        v[i] += pr->sA[k][i][j] * u[j];
-    }
-    phi -= logf(tr * tr - d3dot(v, v));
-  }
-  return phi;
-}
-
-static void p_grad_hess(const cp_prob *pr, float tpar, const float u[],
-                        float g[CP_NVAR_MAX],
-                        float H[CP_NVAR_MAX][CP_NVAR_MAX]) {
-  int a, b, i, j, k;
-  int n = pr->nvar;
-  for (a = 0; a < n; ++a) {
-    g[a] = 0.0;
-    for (b = 0; b < n; ++b)
-      H[a][b] = 0.0;
-  }
-  g[3] = tpar;
-  for (i = 0; i < pr->nlin; ++i) {
-    float f = pr->ld[i], inv;
-    for (j = 0; j < n; ++j)
-      f += pr->lw[i][j] * u[j];
-    inv = 1.0 / (-f);
-    for (a = 0; a < n; ++a) {
-      float wa = pr->lw[i][a];
-      if (wa == 0.0)
-        continue;
-      g[a] += wa * inv;
-      for (b = 0; b < n; ++b)
-        H[a][b] += wa * pr->lw[i][b] * inv * inv;
-    }
-  }
-  for (k = 0; k < pr->nsoc; ++k) {
-    float R = pr->sR[k];
-    float v[3], gs[CP_NVAR_MAX], s, tr;
-    tr = u[3] * R;
-    for (i = 0; i < 3; ++i) {
-      v[i] = pr->sb[k][i];
-      for (j = 0; j < n; ++j)
-        v[i] += pr->sA[k][i][j] * u[j];
-    }
-    s = tr * tr - d3dot(v, v);
-    for (a = 0; a < n; ++a) {
-      gs[a] = -2.0 * (v[0] * pr->sA[k][0][a] + v[1] * pr->sA[k][1][a]
-                      + v[2] * pr->sA[k][2][a]);
-    }
-    gs[3] += 2.0 * R * R * u[3];
-    for (a = 0; a < n; ++a)
-      g[a] -= gs[a] / s;
-    for (a = 0; a < n; ++a) {
-      for (b = 0; b < n; ++b) {
-        float ata = pr->sA[k][0][a] * pr->sA[k][0][b]
-                   + pr->sA[k][1][a] * pr->sA[k][1][b]
-                   + pr->sA[k][2][a] * pr->sA[k][2][b];
-        H[a][b] += gs[a] * gs[b] / (s * s) + 2.0 * ata / s;
-      }
-    }
-    H[3][3] -= 2.0 * R * R / s;
-  }
-}
-
-/* solve H dx = -g, H symmetric positive definite (small ridge added) */
-static int solve_spd(int n, float H[CP_NVAR_MAX][CP_NVAR_MAX],
-                     const float g[CP_NVAR_MAX], float dx[CP_NVAR_MAX]) {
-  float L[CP_NVAR_MAX][CP_NVAR_MAX];
-  float y[CP_NVAR_MAX];
-  int i, j, k;
-  for (i = 0; i < n; ++i)
-    for (j = 0; j < n; ++j)
-      L[i][j] = H[i][j];
-  for (i = 0; i < n; ++i)
-    L[i][i] += 1e-6 * (fabsf(L[i][i]) + 1.0);
-  for (i = 0; i < n; ++i) {
-    for (j = 0; j <= i; ++j) {
-      float sum = L[i][j];
-      for (k = 0; k < j; ++k)
-        sum -= L[i][k] * L[j][k];
-      if (i == j) {
-        if (sum <= 0.0)
-          return 0;
-        L[i][i] = sqrtf(sum);
-      } else {
-        L[i][j] = sum / L[j][j];
-      }
-    }
-  }
-  for (i = 0; i < n; ++i) {
-    float sum = -g[i];
-    for (k = 0; k < i; ++k)
-      sum -= L[i][k] * y[k];
-    y[i] = sum / L[i][i];
-  }
-  for (i = n - 1; i >= 0; --i) {
-    float sum = y[i];
-    for (k = i + 1; k < n; ++k)
-      sum -= L[k][i] * dx[k];
-    dx[i] = sum / L[i][i];
-  }
-  return 1;
-}
-
-/* damped Newton to the barrier central point; returns final decrement^2 */
-static float newton_center(const cp_prob *pr, float tpar, float u[]) {
-  float lam2 = 1e30f;
-  int it, j;
-  for (it = 0; it < 100; ++it) {
-    float g[CP_NVAR_MAX], H[CP_NVAR_MAX][CP_NVAR_MAX], dx[CP_NVAR_MAX];
-    float un[CP_NVAR_MAX], phi0, step;
-    int ok;
-    p_grad_hess(pr, tpar, u, g, H);
-    if (!solve_spd(pr->nvar, H, g, dx))
-      return lam2;
-    lam2 = 0.0;
-    for (j = 0; j < pr->nvar; ++j)
-      lam2 -= g[j] * dx[j];
-    if (lam2 < 1e-6)
-      return lam2 < 0.0 ? 0.0 : lam2;
-    phi0 = p_phi(pr, tpar, u);
-    step = 1.0;
-    ok = 0;
-    while (step > 1e-6) {
-      for (j = 0; j < pr->nvar; ++j)
-        un[j] = u[j] + step * dx[j];
-      if (p_feas(pr, un) &&
-          p_phi(pr, tpar, un) <= phi0 - 0.25 * step * lam2) {
-        ok = 1;
-        break;
-      }
-      step *= 0.5;
-    }
-    if (!ok)
-      return lam2;
-    memcpy(u, un, sizeof(float) * (size_t)pr->nvar);
-  }
-  return lam2;
-}
-
-static void CP_UNUSED_FUNC solve_pair(const cp_shape *sa, const cp_shape *sb,
-                                      cp_result *res) {
-  cp_prob pr;
-  float mid[3], ca[3], cb[3], u[CP_NVAR_MAX];
-  float req, mnu, tpar, alpha, dvec[3], dist;
-  int i, k, tries;
-  memset(&pr, 0, sizeof pr);
-  pr.nvar = 4;
-  for (i = 0; i < 3; ++i) {
-    mid[i] = 0.5 * (sa->c[i] + sb->c[i]);
-    ca[i] = sa->c[i] - mid[i];
-    cb[i] = sb->c[i] - mid[i];
-  }
-  { /* alpha >= 0 (problem (10)); strict alpha > 0 under the barrier */
-    float w[CP_NVAR_MAX];
-    memset(w, 0, sizeof w);
-    w[3] = -1.0;
-    add_lin(&pr, w, 0.0);
-  }
-  add_shape_constraints(&pr, sa, ca);
-  add_shape_constraints(&pr, sb, cb);
-
-  /* strictly feasible start: x = 0 (midpoint), gammas = 0, alpha big */
-  memset(u, 0, sizeof u);
-  req = 0.1;
-  for (i = 0; i < pr.nlin; ++i) {
-    if (pr.lw[i][3] < 0.0) {
-      float need = pr.ld[i] / (-pr.lw[i][3]);
-      if (need > req)
-        req = need;
-    }
-  }
-  for (k = 0; k < pr.nsoc; ++k) {
-    float need = sqrtf(d3dot(pr.sb[k], pr.sb[k])) / pr.sR[k];
-    if (need > req)
-      req = need;
-  }
-  u[3] = 2.0 * req + 1.0;
-  tries = 0;
-  while (!p_feas(&pr, u) && tries++ < 60)
-    u[3] *= 2.0;
-  if (!p_feas(&pr, u)) {
-    res->status = CP_ERR_NO_CONVERGE;
+  s->c = c;
+  if ((VecMovemask(VecCmpLt(mn, VecSet1(-(float)CP_DOMAIN_MAX))) & 0x7) ||
+      (VecMovemask(VecCmpGt(mx, VecSet1((float)CP_DOMAIN_MAX))) & 0x7)) {
+    s->status = CP_ERR_COORD_RANGE;
     return;
   }
-
-  /* barrier path: t *= 20 until gap bound (nlin + 2*nsoc)/t < CP_GAP_TOL */
-  mnu = (float)pr.nlin + 2.0 * (float)pr.nsoc;
-  tpar = 1.0;
-  for (;;) {
-    float lam2 = newton_center(&pr, tpar, u);
-    if (lam2 > 1e-6) {
-      res->status = CP_ERR_NO_CONVERGE;
-      return;
-    }
-    if (mnu / tpar < CP_GAP_TOL)
-      break;
-    tpar *= 20.0;
-  }
-
-  alpha = u[3];
-  for (i = 0; i < 3; ++i)
-    dvec[i] = sa->c[i] - sb->c[i];
-  res->status = CP_OK;
-  res->alpha = (float)alpha;
-  if (alpha < CP_ALPHA_EPS) {
-    /* coincident scaling centers: eq. (24) is 0/0 here. Explicit
-     * policy (src/README.md): colliding, zero distance, p1=p2=c1. */
-    res->colliding = 1;
-    res->distance = 0.0f;
-    for (i = 0; i < 3; ++i) {
-      res->p1[i] = (float)sa->c[i];
-      res->p2[i] = (float)sa->c[i];
-    }
+  ext = VecSub(mx, mn);
+  if (Min3(ext) < CP_EXTENT_MIN || Max3(ext) > CP_EXTENT_MAX) {
+    s->status = CP_ERR_SIZE_RANGE;
     return;
-  }
-  res->colliding = (alpha < 1.0) ? 1u : 0u;
-  dist = sqrtf(d3dot(dvec, dvec)) * (1.0 - 1.0 / alpha);
-  res->distance = (float)dist;
-  for (i = 0; i < 3; ++i) {
-    float xw = u[i] + mid[i];
-    res->p1[i] = (float)(sa->c[i] + (xw - sa->c[i]) / alpha);
-    res->p2[i] = (float)(sb->c[i] + (xw - sb->c[i]) / alpha);
   }
 }
 
@@ -984,51 +600,51 @@ static float closest_seg(v128f a, v128f b) {
 
 /* closest point to origin on triangle abc; bary[3] out; returns mask of
  * vertices kept (bit0=a, bit1=b, bit2=c) */
-static int closest_tri(v128f a, v128f b, v128f c, float bary[3]) {
+static int closest_tri(v128f a, v128f b, v128f c, v128f *bary) {
   v128f ab = VecSub(b, a), ac = VecSub(c, a), bp, cp_;
   float d1, d2, d3, d4, d5, d6, va, vb, vc, denom, v, w;
   d1 = -vdot3(ab, a);
   d2 = -vdot3(ac, a);
   if (d1 <= 0.0f && d2 <= 0.0f) {
-    bary[0] = 1.0f; bary[1] = 0.0f; bary[2] = 0.0f;
+    *bary = VecSetR(1.0f, 0.0f, 0.0f, 0.0f);
     return 1;
   }
   bp = VecNeg(b);
   d3 = vdot3(ab, bp);
   d4 = vdot3(ac, bp);
   if (d3 >= 0.0f && d4 <= d3) {
-    bary[0] = 0.0f; bary[1] = 1.0f; bary[2] = 0.0f;
+    *bary = VecSetR(0.0f, 1.0f, 0.0f, 0.0f);
     return 2;
   }
   vc = d1 * d4 - d3 * d2;
   if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
     v = d1 / (d1 - d3);
-    bary[0] = 1.0f - v; bary[1] = v; bary[2] = 0.0f;
+    *bary = VecSetR(1.0f - v, v, 0.0f, 0.0f);
     return 3;
   }
   cp_ = VecNeg(c);
   d5 = vdot3(ab, cp_);
   d6 = vdot3(ac, cp_);
   if (d6 >= 0.0f && d5 <= d6) {
-    bary[0] = 0.0f; bary[1] = 0.0f; bary[2] = 1.0f;
+    *bary = VecSetR(0.0f, 0.0f, 1.0f, 0.0f);
     return 4;
   }
   vb = d5 * d2 - d1 * d6;
   if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
     w = d2 / (d2 - d6);
-    bary[0] = 1.0f - w; bary[1] = 0.0f; bary[2] = w;
+    *bary = VecSetR(1.0f - w, 0.0f, w, 0.0f);
     return 5;
   }
   va = d3 * d6 - d5 * d4;
   if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
     w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-    bary[0] = 0.0f; bary[1] = 1.0f - w; bary[2] = w;
+    *bary = VecSetR(0.0f, 1.0f - w, w, 0.0f);
     return 6;
   }
   denom = 1.0f / (va + vb + vc);
   v = vb * denom;
   w = vc * denom;
-  bary[0] = 1.0f - v - w; bary[1] = v; bary[2] = w;
+  *bary = VecSetR(1.0f - v - w, v, w, 0.0f);
   return 7;
 }
 
@@ -1038,11 +654,10 @@ typedef struct {
   v128f a[4]; /* support point on A for each vertex       */
 } simplex;
 
-/* bary blend of three v128f points -> v128f */
-static CP_FORCE_INLINE v128f bary3(v128f p0, v128f p1, v128f p2,
-                                   const float bary[3]) {
-  return VecAdd(VecAdd(VecMulf(p0, bary[0]), VecMulf(p1, bary[1])),
-                VecMulf(p2, bary[2]));
+/* bary blend of three v128f points by v128f weights (w.x,w.y,w.z) -> v128f */
+static CP_FORCE_INLINE v128f bary3(v128f p0, v128f p1, v128f p2, v128f w) {
+  return VecAdd(VecAdd(VecMul(p0, VecSplatX(w)), VecMul(p1, VecSplatY(w))),
+                VecMul(p2, VecSplatZ(w)));
 }
 
 /* Reduce the simplex to the minimal face supporting the closest point. Writes
@@ -1069,9 +684,9 @@ static int simplex_closest(simplex *sx, v128f *v, v128f *xa) {
     return 0;
   }
   if (sx->n == 3) {
-    float bary[3];
+    v128f bary;
     v128f q[3], qa[3];
-    int mask = closest_tri(sx->p[0], sx->p[1], sx->p[2], bary);
+    int mask = closest_tri(sx->p[0], sx->p[1], sx->p[2], &bary);
     int k = 0, j;
     *v  = bary3(sx->p[0], sx->p[1], sx->p[2], bary);
     *xa = bary3(sx->a[0], sx->a[1], sx->a[2], bary);
@@ -1124,9 +739,9 @@ static int simplex_closest(simplex *sx, v128f *v, v128f *xa) {
         outside = 0.0;
       }
       if (outside != 0.0) {
-        float bary[3], dd;
-        v128f cv, cxa;
-        int mask = closest_tri(a, b, c, bary), gi[3], k = 0;
+        v128f bary, cv, cxa;
+        float dd;
+        int mask = closest_tri(a, b, c, &bary), gi[3], k = 0;
         found_outside = 1;
         gi[0] = i0; gi[1] = i1; gi[2] = i2;
         cv  = bary3(a, b, c, bary);
@@ -1720,19 +1335,17 @@ static float box_capsule_alpha(const vshape *box, const vshape *capsule) {
 static int sphere_poly_predicate_ok(const vshape *sphere, const vshape *poly,
                                     float alpha) {
   vshape point;
-  float q[3], d, eps;
-  int i;
+  v128f q;
+  float d, eps;
   if (!(alpha > CP_ALPHA_EPS) || !isfinite(alpha))
     return 0;
   point = *sphere;
   point.R = 0.0;
-  for (i = 0; i < 3; ++i) {
-    q[i] = poly->c[i] + (sphere->c[i] - poly->c[i]) / alpha;
-    if (!isfinite(q[i]))
-      return 0;
-    point.c[i] = q[i];
-    point.r[i] = q[i];
-  }
+  q = VecAdd(poly->c, VecDivf(VecSub(sphere->c, poly->c), alpha));
+  if (!isfinite(VecGetX(q)) || !isfinite(VecGetY(q)) || !isfinite(VecGetZ(q)))
+    return 0;
+  point.c = q;
+  point.r = q;
   d = gjk_dist(&point, poly, 1.0, NULL);
   if (!isfinite(d))
     return 0;
@@ -1774,19 +1387,17 @@ static float sphere_poly_alpha(const vshape *sphere, const vshape *poly) {
 static int capsule_poly_predicate_ok(const vshape *capsule, const vshape *poly,
                                      float alpha) {
   vshape seg;
-  float q[3], d, eps;
-  int i;
+  v128f q;
+  float d, eps;
   if (!(alpha > CP_ALPHA_EPS) || !isfinite(alpha))
     return 0;
   seg = *capsule;
   seg.R = 0.0;
-  for (i = 0; i < 3; ++i) {
-    q[i] = poly->c[i] + (capsule->c[i] - poly->c[i]) / alpha;
-    if (!isfinite(q[i]))
-      return 0;
-    seg.c[i] = q[i];
-    seg.r[i] = q[i];
-  }
+  q = VecAdd(poly->c, VecDivf(VecSub(capsule->c, poly->c), alpha));
+  if (!isfinite(VecGetX(q)) || !isfinite(VecGetY(q)) || !isfinite(VecGetZ(q)))
+    return 0;
+  seg.c = q;
+  seg.r = q;
   d = gjk_dist(&seg, poly, 1.0, NULL);
   if (!isfinite(d))
     return 0;
