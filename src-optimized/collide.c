@@ -50,51 +50,54 @@
 #define CP_FORCE_INLINE inline
 #endif
 
-/* SIMD vector ops from the CEngine math library (C:/CEngine). Absolute quoted
- * path so the angle-bracket <math.h> above is never shadowed and no extra -I is
- * needed; SIMD.h's only dependency is IntFloat.h (plain stdint typedefs), so the
- * libc/libm-only link is unchanged. The solver keeps every 3-vector stored as
- * float[3] (the vshape/cp_shape tables serialize as POD blobs, so field layouts
- * must not change) — SIMD is applied inside the hot geometry kernels.
- *
- * vld3 loads exactly three lanes with w=0: Vec3Load/_mm_loadu_ps would read 16
- * bytes from a 12-byte float[3] and trip -Werror=array-bounds. VecSetR compiles
- * to lane inserts with no over-read. */
-/* CEngine SIMD math (C:/CEngine). Absolute quoted path so the angle-bracket
- * <math.h> above is never shadowed and no -I is needed. The headers are
- * inline/macro only (no extra link deps). The pragma block suppresses warnings
- * from third-party header bodies (type-punned BitCast, an unused-function with a
- * paren/promotion nit) without relaxing the flags for our own code. Provides
- * Vec3DotfV, Vec3Cross, Vec3Store, Max3, Min3, Sqrtf, VecMin/Max, etc. */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wstrict-aliasing"
-#pragma GCC diagnostic ignored "-Wparentheses"
-#pragma GCC diagnostic ignored "-Wdouble-promotion"
-#pragma GCC diagnostic ignored "-Wsign-compare"
-#pragma GCC diagnostic ignored "-Wunused-function"
-#include "C:/CEngine/Math/Math.h"
-#pragma GCC diagnostic pop
+/* Vendored SSE/NEON SIMD primitives (src-optimized/SIMD.h, IntFloat.h), derived
+ * from the CEngine math library. Header-only/inline (macros + static inline), so
+ * the libc/libm-only link is unchanged. Quoted include resolves next to this
+ * file, so the angle-bracket <math.h> above is never shadowed. The solver stores
+ * every internal 3-vector as a v128f (xyz; w = 0); float[3] survives only at the
+ * public ABI boundary (cp_prim / cp_result). */
+#include "SIMD.h"
 
-/* Every internal 3-vector is a v128f (xyz; w = 0). float[3] survives only at the
- * public ABI boundary (cp_prim / cp_result). vld3 is the one helper not already
- * in CEngine: a SAFE 3-float load. It reads exactly 12 bytes (loadl_pi for xy +
- * a lane insert for z); Vec3Load/_mm_loadu_ps would read 16 bytes from a
- * 12-byte float[3] (over-read, -Werror=array-bounds), and a VecSetR of the three
- * lanes lets -O3 re-coalesce into the same 16-byte movups. */
+/* vld3: SAFE 3-float load (xyz, w=0). Reads exactly 12 bytes (loadl_pi for xy +
+ * a lane insert for z). Vec3Load/_mm_loadu_ps would read 16 bytes from a 12-byte
+ * float[3] (over-read, -Werror=array-bounds), and a VecSetR of the three lanes
+ * lets -O3 re-coalesce into the same 16-byte movups. */
 static CP_FORCE_INLINE v128f vld3(const float p[3]) {
   v128f v = VecLoadLo64(p, VecZero());
   VecSetZ(v, p[2]);
   return v;
 }
 
-/* 3-lane dot -> float. Deliberately NOT Vec3DotfV (which is _mm_dp_ps): DPPS has
- * ~13-cycle latency and the solver's dots sit on dependency chains (GJK,
- * bisection), so the latency serializes. A multiply + 3 lane extracts + 2 adds
- * is far shorter-latency on a live register and measures ~37% faster end to end
- * (and beats the scalar float[3] build, which has to reload three scalars). */
+/* 3-lane dot -> float. Deliberately a multiply + 3 lane extracts + 2 adds rather
+ * than _mm_dp_ps: DPPS has ~13-cycle latency and the solver's dots sit on
+ * dependency chains (GJK, alpha bisection), so the latency serializes. This form
+ * is far shorter-latency on a live register and measured ~37% faster end to end
+ * (it also beats the scalar float[3] build, which reloads three scalars). */
 static CP_FORCE_INLINE float vdot3(v128f a, v128f b) {
   v128f m = VecMul(a, b);
   return VecGetX(m) + VecGetY(m) + VecGetZ(m);
+}
+
+/* Small geometry helpers that live in CEngine's Math.h (not vendored here, to
+ * keep the dependency to the two clean SIMD headers). None use _mm_dp_ps. */
+static CP_FORCE_INLINE v128f Vec3Cross(v128f a, v128f b) {
+  v128f t0 = VecShuffleR(a, a, 3, 0, 2, 1);
+  v128f t1 = VecShuffleR(b, b, 3, 1, 0, 2);
+  v128f t2 = VecMul(t0, b);
+  v128f t3 = VecMul(t0, t1);
+  v128f t4 = VecShuffleR(t2, t2, 3, 0, 2, 1);
+  return VecSub(t3, t4);
+}
+static CP_FORCE_INLINE void Vec3Store(float o[3], v128f v) {
+  o[0] = VecGetX(v);
+  o[1] = VecGetY(v);
+  o[2] = VecGetZ(v);
+}
+static CP_FORCE_INLINE float Max3(v128f v) { /* max of xyz (w ignored) */
+  return VecGetX(VecMax(v, VecMax(VecSplatY(v), VecSplatZ(v))));
+}
+static CP_FORCE_INLINE float Min3(v128f v) { /* min of xyz (w ignored) */
+  return VecGetX(VecMin(v, VecMin(VecSplatY(v), VecSplatZ(v))));
 }
 
 #define CP_DOMAIN_MAX 8192.0

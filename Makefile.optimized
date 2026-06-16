@@ -34,8 +34,11 @@ optimized: $(B)/test_runner_opt $(B)/perf_harness_opt $(B)/perf_validate_opt \
 $(B):
 	mkdir -p $(B)
 
-# Optimized library object — single precision (see OPT_FP).
-$(B)/collide_opt.o: src-optimized/collide.c src-optimized/collide.h | $(B)
+# Optimized library object — single precision (see OPT_FP). The SIMD primitives
+# are vendored in-tree (src-optimized/SIMD.h, IntFloat.h), so the build is
+# self-contained — no external include path.
+$(B)/collide_opt.o: src-optimized/collide.c src-optimized/collide.h \
+                    src-optimized/SIMD.h src-optimized/IntFloat.h | $(B)
 	$(CC) $(CFLAGS) $(OPT_FP) -c src-optimized/collide.c -o $@
 
 # Independent validator, compiled for optimized linkage (distinct object name;
